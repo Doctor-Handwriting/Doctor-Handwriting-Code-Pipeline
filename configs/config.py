@@ -81,7 +81,7 @@ class AugmentationConfig:
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
     model_type: Literal["qwen-vl", "yolo"] = "qwen-vl"
-    qwen_checkpoint: str = "Qwen/Qwen3-VL-2B-Instruct"
+    qwen_checkpoint: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     yolo_checkpoint: str = "yolov8n.pt"
     max_pixels: int = 512 * 512
     min_pixels: int = 256 * 256

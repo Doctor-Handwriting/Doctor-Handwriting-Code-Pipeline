@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import Trainer, TrainingArguments
 import json
+import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -30,12 +32,66 @@ STAGE = "train"  # Options: "augment", "train", "infer"
 MODEL_CHOICE = "qwen-vl" #Options: "qwen-vl" or "yolo"
 
 
-class VLMDataset(Dataset):
-    """PyTorch Dataset for Vision-Language Model instruction tuning."""
+def build_messages(prompt: str, response: str = None) -> List[Dict]:
+    """Qwen-VL chat format; the image placeholder is expanded by the processor."""
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt.replace("<image>", "").strip()},
+        ],
+    }]
+    if response is not None:
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": response}]})
+    return messages
 
-    def __init__(self, records: List[Dict], processor, augmentor=None, max_samples: int = None):
-        self.records = records[:max_samples] if max_samples else records
+
+def limit_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
+    w, h = image.size
+    if w * h <= max_pixels:
+        return image
+    scale = (max_pixels / (w * h)) ** 0.5
+    return image.resize((max(28, int(w * scale)), max(28, int(h * scale))), Image.BICUBIC)
+
+
+class QwenVLCollator:
+    """Runs the processor on the whole batch so every model-specific key
+    (pixel_values, image_grid_thw, mm_token_type_ids, ...) is passed through untouched."""
+
+    def __init__(self, processor, max_pixels: int):
         self.processor = processor
+        self.max_pixels = max_pixels
+        self.im_start_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+
+    def __call__(self, batch: List[Dict]) -> Dict:
+        texts = [
+            self.processor.apply_chat_template(
+                build_messages(item["prompt"], item["response"]),
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            for item in batch
+        ]
+        images = [limit_image_pixels(item["image"], self.max_pixels) for item in batch]
+
+        inputs = self.processor(text=texts, images=images, padding=True, return_tensors="pt")
+
+        # Train only on the answer: mask everything up to and including "<|im_start|>assistant\n".
+        labels = inputs["input_ids"].clone()
+        labels[inputs["attention_mask"] == 0] = -100
+        for row in range(labels.size(0)):
+            starts = (inputs["input_ids"][row] == self.im_start_id).nonzero(as_tuple=True)[0]
+            labels[row, : starts[-1] + 3] = -100
+        inputs["labels"] = labels
+
+        return dict(inputs)
+
+
+class VLMDataset(Dataset):
+    """Returns raw image + text; tokenization happens in QwenVLCollator."""
+
+    def __init__(self, records: List[Dict], augmentor=None, max_samples: int = None):
+        self.records = records[:max_samples] if max_samples else records
         self.augmentor = augmentor
 
     def __len__(self):
@@ -45,36 +101,19 @@ class VLMDataset(Dataset):
         record = self.records[idx]
 
         try:
-            from PIL import Image
             image = Image.open(record["image"]).convert("RGB")
         except Exception as e:
             logger.warning(f"Failed to load image {record['image']}: {e}")
             return self.__getitem__((idx + 1) % len(self.records))
 
-        import numpy as np
-        image_array = np.array(image)
         if self.augmentor:
-            image_array = self.augmentor(image_array)
-            image = Image.fromarray(image_array)
+            image = Image.fromarray(self.augmentor(np.array(image)))
 
         conversations = record["conversations"]
-        prompt = conversations[0]["value"]
-        response = conversations[1]["value"] if len(conversations) > 1 else ""
-
-        text = f"{prompt}\n{response}"
-
-        inputs = self.processor(
-            text=text,
-            images=image,
-            return_tensors="pt",
-            max_pixels=512 * 512,
-            min_pixels=256 * 256,
-        )
-
         return {
-            "input_ids": inputs["input_ids"].squeeze(),
-            "pixel_values": inputs.get("pixel_values", torch.tensor([])).squeeze(),
-            "attention_mask": inputs.get("attention_mask", torch.ones_like(inputs["input_ids"])).squeeze(),
+            "image": image,
+            "prompt": conversations[0]["value"],
+            "response": conversations[1]["value"] if len(conversations) > 1 else "",
         }
 
 
@@ -159,8 +198,8 @@ def train_stage(cfg: PipelineConfig) -> None:
 
     augmentor = get_augmentor(cfg.augmentation)
 
-    train_dataset = VLMDataset(train_records, processor, augmentor)
-    val_dataset = VLMDataset(val_records, processor)
+    train_dataset = VLMDataset(train_records, augmentor)
+    val_dataset = VLMDataset(val_records)
 
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
@@ -175,7 +214,7 @@ def train_stage(cfg: PipelineConfig) -> None:
         weight_decay=cfg.training.weight_decay,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         logging_steps=cfg.log_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=cfg.eval_steps,
         save_steps=cfg.save_steps,
         save_strategy="steps",
@@ -184,9 +223,9 @@ def train_stage(cfg: PipelineConfig) -> None:
         dataloader_num_workers=cfg.training.num_workers,
         dataloader_pin_memory=cfg.training.pin_memory,
         gradient_checkpointing=cfg.training.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=cfg.training.max_grad_norm,
         seed=cfg.training.seed,
-        logging_dir=cfg.log_dir,
         remove_unused_columns=False,
     )
 
@@ -195,6 +234,7 @@ def train_stage(cfg: PipelineConfig) -> None:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        data_collator=QwenVLCollator(processor, cfg.model.max_pixels),
     )
 
     logger.info("Starting training...")
@@ -235,28 +275,26 @@ def infer_stage(cfg: PipelineConfig) -> None:
     with torch.no_grad():
         for record in tqdm(sample_records, desc="Running inference"):
             try:
-                from PIL import Image
                 image = Image.open(record["image"]).convert("RGB")
             except Exception as e:
                 logger.warning(f"Failed to load image {record['image']}: {e}")
                 continue
 
             prompt = record["conversations"][0]["value"]
+            text = processor.apply_chat_template(
+                build_messages(prompt), tokenize=False, add_generation_prompt=True
+            )
 
             inputs = processor(
-                text=prompt,
-                images=image,
+                text=[text],
+                images=[limit_image_pixels(image, cfg.model.max_pixels)],
                 return_tensors="pt",
             ).to(cfg.device)
 
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                do_sample=False,
-                temperature=0.0,
-            )
+            outputs = model.generate(**inputs, max_new_tokens=64, do_sample=False)
 
-            generated_text = processor.decode(outputs[0], skip_special_tokens=True)
+            new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+            generated_text = processor.decode(new_tokens, skip_special_tokens=True).strip()
 
             results.append({
                 "image_id": record["id"],

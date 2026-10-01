@@ -1,0 +1,35 @@
+# Local project instructions
+CLAUDE.md
+
+# Python environments and caches
+Dataset/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.python-version
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Generated pipeline outputs
+runs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.log
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

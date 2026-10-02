@@ -21,5 +21,6 @@ pillow>=10.2.0
 datasets>=2.19.0
 jiwer>=3.0.3
 tensorboard>=2.16.0
+matplotlib>=3.8.0  # training curves saved to runs/<model>/<run>/plots/
 tqdm>=4.66.0
 numpy>=1.24.0

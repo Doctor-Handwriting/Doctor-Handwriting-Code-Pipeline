@@ -7,13 +7,14 @@ logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
 import torch
 import tracemalloc
+from dataclasses import asdict
 from pathlib import Path
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import Trainer, TrainingArguments
-from transformers.trainer_callback import ProgressCallback
+from transformers.trainer_callback import ProgressCallback, TrainerCallback
 from transformers.integrations import TensorBoardCallback
 import json
 import numpy as np
@@ -26,6 +27,7 @@ from models.models import load_qwen_vl, load_yolo_model
 from utils.dataset_parser import parse_all_datasets, save_dataset_json
 from utils.augmentor import get_augmentor
 from utils.metrics import TextMetrics, TrainingMetrics
+from utils.visualization import plot_training_curves, save_history, save_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,8 +135,8 @@ class MetricsProgressCallback(ProgressCallback):
     """Training progress bar with live loss/LR/eval metrics in the postfix and a
     formatted table printed after every evaluation."""
 
-    POSTFIX_KEYS = ("loss", "learning_rate", "grad_norm", "epoch")
-    EVAL_POSTFIX_KEYS = ("eval_loss", "eval_cer", "eval_wer", "eval_accuracy")
+    POSTFIX_KEYS = ("loss", "token_accuracy", "learning_rate", "grad_norm", "epoch")
+    EVAL_POSTFIX_KEYS = ("eval_loss", "eval_token_accuracy", "eval_cer", "eval_wer", "eval_accuracy")
 
     def __init__(self):
         super().__init__()
@@ -159,14 +161,48 @@ class MetricsProgressCallback(ProgressCallback):
         for key in keys:
             if key in logs:
                 value = logs[key]
-                self.postfix[key.replace("learning_rate", "lr")] = f"{value:.3g}" if isinstance(value, float) else value
+                short = key.replace("learning_rate", "lr").replace("token_accuracy", "tok_acc")
+                self.postfix[short] = f"{value:.3g}" if isinstance(value, float) else value
         if bar is not None:
             bar.set_postfix(self.postfix, refresh=True)
 
 
+class TrainingPlotCallback(TrainerCallback):
+    """Keeps the full metric history of the run and redraws the loss/accuracy plots
+    (plus metrics_history.json/.csv) after every evaluation and at the end of training."""
+
+    def __init__(self, run_dir: str, plots_dir: str):
+        self.run_dir = run_dir
+        self.plots_dir = plots_dir
+        self.history = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.is_world_process_zero and logs:
+            self.history.append({"step": state.global_step, "epoch": state.epoch, **logs})
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self.save()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self.save()
+
+    def save(self) -> None:
+        # A plotting failure must never stop training.
+        try:
+            save_history(self.history, self.run_dir)
+            save_summary(self.history, self.run_dir)
+            plot_training_curves(self.history, self.plots_dir)
+        except Exception as e:
+            logger.warning(f"Could not save training plots: {e}")
+
+
 class GenerationEvalTrainer(Trainer):
     """Trainer whose evaluation also decodes a val subset with generate() and reports
-    WER/CER/accuracy alongside eval_loss, so all metrics are logged together."""
+    WER/CER/accuracy alongside eval_loss, so all metrics are logged together.
+    Also tracks next-token accuracy on answer tokens: logged as token_accuracy (train,
+    averaged over each logging window) and eval_token_accuracy (validation)."""
 
     def __init__(self, *args, processor=None, gen_eval_records=None,
                  max_pixels: int = 512 * 512, max_new_tokens: int = 64, **kwargs):
@@ -175,10 +211,46 @@ class GenerationEvalTrainer(Trainer):
         self.gen_eval_records = gen_eval_records or []
         self.max_pixels = max_pixels
         self.max_new_tokens = max_new_tokens
+        # split -> [correct, total] answer tokens, kept as tensors to avoid a GPU sync per step
+        self._token_acc = {"train": [0, 0], "eval": [0, 0]}
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+
+        logits = getattr(outputs, "logits", None)
+        if labels is not None and logits is not None:
+            with torch.no_grad():
+                preds = logits[:, :-1].argmax(dim=-1)
+                targets = labels[:, 1:].to(preds.device)
+                mask = targets != -100
+                acc = self._token_acc["train" if model.training else "eval"]
+                acc[0] += (preds.eq(targets) & mask).sum()
+                acc[1] += mask.sum()
+
+        return (loss, outputs) if return_outputs else loss
+
+    def _pop_token_accuracy(self, split: str):
+        correct, total = self._token_acc[split]
+        self._token_acc[split] = [0, 0]
+        total = int(total)
+        return int(correct) / total if total else None
+
+    def log(self, logs, *args, **kwargs):
+        if "loss" in logs:
+            token_accuracy = self._pop_token_accuracy("train")
+            if token_accuracy is not None:
+                logs["token_accuracy"] = token_accuracy
+        super().log(logs, *args, **kwargs)
 
     def evaluation_loop(self, *args, **kwargs):
+        self._token_acc["eval"] = [0, 0]
         output = super().evaluation_loop(*args, **kwargs)
         prefix = kwargs.get("metric_key_prefix", "eval")
+
+        token_accuracy = self._pop_token_accuracy("eval")
+        if token_accuracy is not None:
+            output.metrics[f"{prefix}_token_accuracy"] = token_accuracy
 
         if self.gen_eval_records and self.processor is not None:
             with self.autocast_smart_context_manager():
@@ -280,9 +352,9 @@ class MemoryProfiler:
         return 0.0
 
 
-def setup_directories(cfg: PipelineConfig) -> None:
+def setup_directories(*directories: str) -> None:
     """Create output directories."""
-    for directory in [cfg.output_dir, cfg.checkpoint_dir, cfg.log_dir]:
+    for directory in directories:
         os.makedirs(directory, exist_ok=True)
         logger.info(f"Directory ready: {directory}")
 
@@ -293,7 +365,7 @@ def augment_stage(cfg: PipelineConfig) -> None:
     logger.info("STAGE: AUGMENTATION")
     logger.info("=" * 60)
 
-    setup_directories(cfg)
+    setup_directories(cfg.output_dir)
 
     logger.info("Parsing datasets...")
     train_records, val_records = parse_all_datasets(cfg.dataset)
@@ -315,7 +387,10 @@ def train_stage(cfg: PipelineConfig) -> None:
     logger.info("STAGE: TRAINING")
     logger.info("=" * 60)
 
-    setup_directories(cfg)
+    setup_directories(cfg.run_dir, cfg.checkpoint_dir, cfg.log_dir, cfg.plots_dir)
+    logger.info(f"Run folder: {cfg.run_dir}")
+    with open(os.path.join(cfg.run_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump({"model_name": cfg.model_name, **asdict(cfg)}, f, indent=2, default=str)
     mem_profiler = MemoryProfiler()
     mem_profiler.start()
 
@@ -388,16 +463,18 @@ def train_stage(cfg: PipelineConfig) -> None:
     trainer.remove_callback(ProgressCallback)
     trainer.add_callback(MetricsProgressCallback())
     trainer.add_callback(TensorBoardCallback(tb_writer=SummaryWriter(log_dir=cfg.log_dir)))
+    trainer.add_callback(TrainingPlotCallback(cfg.run_dir, cfg.plots_dir))
 
     logger.info("Starting training...")
     trainer.train()
 
     logger.info("Running final evaluation...")
     final_metrics = trainer.evaluate()
-    metrics_file = os.path.join(cfg.output_dir, "eval_metrics.json")
+    metrics_file = os.path.join(cfg.run_dir, "eval_metrics.json")
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2)
     logger.info(f"Final evaluation metrics saved to {metrics_file}")
+    logger.info(f"Training plots saved to {cfg.plots_dir}")
 
     allocated_mb, peak_mb = mem_profiler.end()
     logger.info(f"Memory used - Allocated: {allocated_mb:.2f} MB, Peak: {peak_mb:.2f} MB")
@@ -413,7 +490,8 @@ def infer_stage(cfg: PipelineConfig) -> None:
     logger.info("STAGE: INFERENCE")
     logger.info("=" * 60)
 
-    setup_directories(cfg)
+    setup_directories(cfg.run_dir)
+    logger.info(f"Run folder: {cfg.run_dir}")
 
     adapter_path = cfg.evaluation.adapter_path
     if not os.path.isdir(adapter_path):
@@ -442,7 +520,7 @@ def infer_stage(cfg: PipelineConfig) -> None:
             cfg.evaluation.max_new_tokens, desc="Running inference",
         )
 
-    output_file = os.path.join(cfg.output_dir, "inference_results.json")
+    output_file = os.path.join(cfg.run_dir, "inference_results.json")
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
@@ -450,7 +528,7 @@ def infer_stage(cfg: PipelineConfig) -> None:
 
     if metrics:
         metrics["num_samples"] = len(results)
-        metrics_file = os.path.join(cfg.output_dir, "inference_metrics.json")
+        metrics_file = os.path.join(cfg.run_dir, "inference_metrics.json")
         with open(metrics_file, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         logger.info(format_metrics_table(metrics, "INFERENCE METRICS"))
@@ -483,6 +561,8 @@ def main():
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     logger.info(f"Dataset root: {cfg.dataset.dataset_root}")
     logger.info(f"Output dir: {cfg.output_dir}")
+    if cfg.stage != "augment":
+        logger.info(f"Run dir: {cfg.run_dir}")
     logger.info("=" * 60 + "\n")
 
     # Fail fast (before downloading the model) when the GPU is not usable.

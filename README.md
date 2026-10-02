@@ -25,10 +25,20 @@ vlm_pipeline/
 │   ├── __init__.py
 │   ├── dataset_parser.py  # DHP + RxHand parsing to instruction format
 │   ├── augmentor.py       # Medical handwriting augmentations
-│   └── metrics.py         # WER, CER, accuracy, mAP computation
-├── runs/                  # Outputs: logs, checkpoints, metrics
-│   ├── logs/
-│   └── checkpoints/
+│   ├── metrics.py         # WER, CER, accuracy, mAP computation
+│   └── visualization.py   # Loss/accuracy/CER/WER/LR training plots
+├── runs/                  # Outputs, one folder per model per run
+│   ├── train_augmented.json, val_augmented.json   # augment stage
+│   └── <model_name>/                               # e.g. Qwen3-VL-2B-Instruct
+│       └── run_<YYYYmmdd-HHMMSS>_<profile>/
+│           ├── checkpoints/        # checkpoint-*/ and final/ (LoRA adapter)
+│           ├── logs/               # TensorBoard events
+│           ├── plots/              # loss, accuracy, error_rates, learning_rate, training_overview .png
+│           ├── metrics_history.json / .csv   # every logged train/eval value
+│           ├── metrics_summary.csv # best / average / last loss & accuracy
+│           ├── eval_metrics.json   # final evaluation
+│           ├── run_config.json     # full config snapshot of the run
+│           └── inference_results.json, inference_metrics.json   # infer stage
 ├── main.py                # Pipeline orchestrator (augment/train/infer)
 └── requirements.txt       # All dependencies
 ```
@@ -185,20 +195,32 @@ Datasets are automatically converted to multimodal instruction format:
 
 ### TensorBoard
 ```bash
-tensorboard --logdir runs/logs
+tensorboard --logdir runs   # every run of every model, side by side
+```
+
+### Training Plots
+After every evaluation and at the end of training, PNG charts are (re)written to
+`runs/<model_name>/<run>/plots/`: loss (train vs val), accuracy (train/val token accuracy and
+val exact match), val CER/WER, learning rate, and a 2x2 `training_overview.png`.
+Redraw them for any past run (falls back to the newest `trainer_state.json` for older runs):
+```bash
+python -m utils.visualization runs/Qwen3-VL-2B-Instruct/run_20261002-120000_laptop_3050ti
 ```
 
 ### Checkpoints
 - Auto-saved every `save_steps` iterations
-- Best model in `runs/checkpoints/final`
+- Final adapter in `runs/<model_name>/<run>/checkpoints/final`
 - Resume training from checkpoint (automatic)
 
 ### Progress & Metrics
-Training shows a progress bar with live `loss`, `lr`, `grad_norm` and the latest eval metrics.
+Training shows a progress bar with live `loss`, `tok_acc`, `lr`, `grad_norm` and the latest eval metrics.
 Every `eval_steps` a table of all evaluation metrics is printed and logged to TensorBoard;
-the final evaluation is saved to `runs/eval_metrics.json`. The infer stage evaluates the
-trained adapter (`runs/checkpoints/final`) on the validation set and writes
-`runs/inference_results.json` (per sample) and `runs/inference_metrics.json`.
+the final evaluation is saved to `<run>/eval_metrics.json`. The infer stage evaluates the
+latest trained run of the model (`<run>/checkpoints/final`; set `cfg.run_name` to pick another)
+on the validation set and writes `inference_results.json` (per sample) and
+`inference_metrics.json` into that run's folder.
+
+- **token_accuracy / eval_token_accuracy**: Next-token accuracy on answer tokens (teacher-forced), train and val
 
 - **eval_loss**: Validation loss (teacher-forced)
 - **WER / MER / WIL**: Word error / match error / word information lost rates — lower is better
@@ -224,7 +246,7 @@ WER/CER/accuracy require `model.generate`, which is slow, so during training the
    # Trainer automatically resumes from latest checkpoint
    ```
 
-3. **Validation**: Check `runs/logs/events.out.tfevents.*` in TensorBoard
+3. **Validation**: Check `runs/<model_name>/<run>/plots/` or TensorBoard
 
 4. **Fine-tune Learning Rate**: Start at 1e-4, adjust if loss plateaus
    ```python

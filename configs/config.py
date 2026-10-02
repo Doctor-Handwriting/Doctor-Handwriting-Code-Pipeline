@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, List, Optional
@@ -66,6 +67,12 @@ HARDWARE_PROFILES = {
         allow_tf32=True,
     ),
 }
+
+
+def find_latest_run(model_dir: Path) -> Optional[Path]:
+    """Most recently trained run under <output_dir>/<model_name> (one with checkpoints/final)."""
+    finals = [p for p in model_dir.glob("*/checkpoints/final") if p.is_dir()]
+    return max(finals, key=lambda p: p.stat().st_mtime).parent.parent if finals else None
 
 
 def detect_hardware_profile() -> str:
@@ -216,22 +223,47 @@ class PipelineConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     output_dir: str = OUTPUT_ROOT.as_posix()
-    # Left empty -> derived from output_dir in __post_init__.
+    # Every run gets its own folder: <output_dir>/<model_name>/<run_name>/
+    #   checkpoints/  logs/  plots/  metrics_history.{json,csv}  eval_metrics.json  run_config.json
+    # Left empty -> "run_<timestamp>_<hardware_profile>" for train; for infer, the latest trained run.
+    run_name: str = ""
+    # Left empty -> derived from output_dir/run_name in __post_init__.
+    run_dir: str = ""
     checkpoint_dir: str = ""
     log_dir: str = ""
+    plots_dir: str = ""
     save_steps: int = 100
     eval_steps: int = 100
     log_steps: int = 10
 
     def __post_init__(self):
         """Validate configuration after initialization."""
-        self.checkpoint_dir = self.checkpoint_dir or (Path(self.output_dir) / "checkpoints").as_posix()
-        self.log_dir = self.log_dir or (Path(self.output_dir) / "logs").as_posix()
-        self.evaluation.adapter_path = self.evaluation.adapter_path or (Path(self.checkpoint_dir) / "final").as_posix()
-
         if self.model_type != self.model.model_type:
             self.model.model_type = self.model_type
         self.apply_hardware_profile()
+        self.resolve_run_paths()
+
+    @property
+    def model_name(self) -> str:
+        """Folder name for the model, e.g. "Qwen3-VL-2B-Instruct" or "yolov8n"."""
+        if self.model_type == "yolo":
+            name = Path(self.model.yolo_checkpoint).name
+            return name[:-3] if name.endswith(".pt") else name
+        return self.model.qwen_checkpoint.rstrip("/").split("/")[-1]
+
+    def resolve_run_paths(self) -> None:
+        """Derive this run's folder and its sub-folders (directories are created by the stages)."""
+        model_dir = Path(self.output_dir) / self.model_name
+        if not self.run_name:
+            latest = find_latest_run(model_dir) if self.stage == "infer" else None
+            self.run_name = latest.name if latest else (
+                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}")
+        run = Path(self.run_dir or model_dir / self.run_name)
+        self.run_dir = run.as_posix()
+        self.checkpoint_dir = self.checkpoint_dir or (run / "checkpoints").as_posix()
+        self.log_dir = self.log_dir or (run / "logs").as_posix()
+        self.plots_dir = self.plots_dir or (run / "plots").as_posix()
+        self.evaluation.adapter_path = self.evaluation.adapter_path or (Path(self.checkpoint_dir) / "final").as_posix()
 
     def apply_hardware_profile(self) -> None:
         """Overwrite machine-dependent settings with the selected hardware profile."""

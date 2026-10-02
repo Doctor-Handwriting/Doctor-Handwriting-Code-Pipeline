@@ -36,7 +36,7 @@ MODEL_CHOICE = "qwen-vl" #Options: "qwen-vl" or "yolo"
 #          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
 #          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (bf16 LoRA, batch 4x2)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
-HARDWARE_PROFILE = "auto"
+HARDWARE_PROFILE = "laptop_3050ti"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:

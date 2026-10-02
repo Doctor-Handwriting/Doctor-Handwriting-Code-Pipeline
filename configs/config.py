@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, List, Optional
 import torch
@@ -13,6 +13,67 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_ROOT = Path(os.environ.get("VLM_DATASET_ROOT", PROJECT_ROOT / "Dataset")).resolve()
 OUTPUT_ROOT = Path(os.environ.get("VLM_OUTPUT_DIR", PROJECT_ROOT / "runs")).resolve()
+
+
+@dataclass
+class HardwareProfile:
+    """Machine-specific settings applied on top of the defaults below."""
+    description: str
+    load_in_4bit: bool
+    compute_dtype: torch.dtype
+    per_device_train_batch_size: int
+    per_device_eval_batch_size: int
+    gradient_accumulation_steps: int
+    gradient_checkpointing: bool
+    num_workers: int
+    pin_memory: bool
+    max_pixels: int
+    train_eval_samples: Optional[int]
+    allow_tf32: bool
+
+
+# Select one in main.py via HARDWARE_PROFILE (or "auto" to pick by detected VRAM).
+# Both keep an effective batch size of 8 so results stay comparable across machines.
+HARDWARE_PROFILES = {
+    # Laptop: Ryzen 7, 16GB RAM, RTX 3050 Ti 4GB
+    "laptop_3050ti": HardwareProfile(
+        description="RTX 3050 Ti 4GB / 16GB RAM - 4-bit NF4 + LoRA, fp16",
+        load_in_4bit=True,
+        compute_dtype=torch.float16,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=8,
+        gradient_checkpointing=True,
+        num_workers=2,
+        pin_memory=False,
+        max_pixels=512 * 512,
+        train_eval_samples=50,
+        allow_tf32=False,
+    ),
+    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
+    "pc_5070": HardwareProfile(
+        description="RTX 5070 12GB / 32GB RAM - bf16 LoRA (no quantization)",
+        load_in_4bit=False,
+        compute_dtype=torch.bfloat16,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=2,
+        gradient_checkpointing=True,
+        num_workers=4,
+        pin_memory=True,
+        max_pixels=768 * 768,
+        train_eval_samples=100,
+        allow_tf32=True,
+    ),
+}
+
+
+def detect_hardware_profile() -> str:
+    """Pick a profile from the detected GPU's VRAM (>=10GB -> pc_5070)."""
+    if not torch.cuda.is_available():
+        return "laptop_3050ti"
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    return "pc_5070" if vram_gb >= 10 else "laptop_3050ti"
 
 
 @dataclass
@@ -141,6 +202,7 @@ class ModelConfig:
 class PipelineConfig:
     """Master pipeline configuration."""
     stage: Literal["augment", "train", "infer"] = "train"
+    hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
     model_type: Literal["qwen-vl", "yolo"] = "qwen-vl"
     device: str = "cuda"
     mixed_precision: str = "fp16"
@@ -169,6 +231,44 @@ class PipelineConfig:
 
         if self.model_type != self.model.model_type:
             self.model.model_type = self.model_type
-        if self.stage != "infer" and self.training.per_device_train_batch_size > 1:
-            print(f"[WARNING] Reducing batch size to 1 for 4GB VRAM safety")
-            self.training.per_device_train_batch_size = 1
+        self.apply_hardware_profile()
+
+    def apply_hardware_profile(self) -> None:
+        """Overwrite machine-dependent settings with the selected hardware profile."""
+        if self.hardware_profile == "auto":
+            self.hardware_profile = detect_hardware_profile()
+        if self.hardware_profile not in HARDWARE_PROFILES:
+            raise ValueError(f"Unknown hardware profile '{self.hardware_profile}'. "
+                             f"Options: auto, {', '.join(HARDWARE_PROFILES)}")
+        hw = HARDWARE_PROFILES[self.hardware_profile]
+
+        if hw.compute_dtype == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            print("[WARNING] GPU does not support bf16, falling back to fp16")
+            hw = replace(hw, compute_dtype=torch.float16)
+        use_bf16 = hw.compute_dtype == torch.bfloat16
+
+        self.quantization.load_in_4bit = hw.load_in_4bit
+        self.quantization.bnb_4bit_compute_dtype = hw.compute_dtype
+        self.mixed_precision = "bf16" if use_bf16 else "fp16"
+
+        t = self.training
+        t.per_device_train_batch_size = hw.per_device_train_batch_size
+        t.per_device_eval_batch_size = hw.per_device_eval_batch_size
+        t.gradient_accumulation_steps = hw.gradient_accumulation_steps
+        t.gradient_checkpointing = hw.gradient_checkpointing
+        t.num_workers = hw.num_workers
+        t.pin_memory = hw.pin_memory
+        t.use_bf16 = use_bf16
+        t.use_fp16 = not use_bf16
+
+        self.model.gradient_checkpointing = hw.gradient_checkpointing
+        self.model.max_pixels = hw.max_pixels
+        self.evaluation.train_eval_samples = hw.train_eval_samples
+
+        if hw.allow_tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self.quantization.bnb_4bit_compute_dtype

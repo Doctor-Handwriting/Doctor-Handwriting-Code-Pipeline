@@ -33,7 +33,8 @@ vlm_pipeline/
 │       └── run_<YYYYmmdd-HHMMSS>_<profile>/
 │           ├── checkpoints/        # checkpoint-*/ and final/ (LoRA adapter)
 │           ├── logs/               # TensorBoard events
-│           ├── plots/              # loss, accuracy, error_rates, learning_rate, training_overview .png
+│           ├── plots/              # loss, accuracy, error_rates, learning_rate, training_overview,
+│           │                       # evaluation_metrics (every metric), final_metrics, inference_metrics .png
 │           ├── metrics_history.json / .csv   # every logged train/eval value
 │           ├── metrics_summary.csv # best / average / last loss & accuracy
 │           ├── eval_metrics.json   # final evaluation
@@ -201,7 +202,10 @@ tensorboard --logdir runs   # every run of every model, side by side
 ### Training Plots
 After every evaluation and at the end of training, PNG charts are (re)written to
 `runs/<model_name>/<run>/plots/`: loss (train vs val), accuracy (train/val token accuracy and
-val exact match), val CER/WER, learning rate, and a 2x2 `training_overview.png`.
+val exact match), val CER/WER, learning rate, a 2x2 `training_overview.png`, `evaluation_metrics.png` (one panel
+per evaluation metric: loss, token accuracy, exact match, normalized match, char accuracy, CER, WER,
+MER, WIL) and `final_metrics.png` (bar chart of the latest evaluation). The infer stage adds
+`inference_metrics.png`. `metrics_summary.csv` holds best/average/last of every metric.
 Redraw them for any past run (falls back to the newest `trainer_state.json` for older runs):
 ```bash
 python -m utils.visualization runs/Qwen3-VL-2B-Instruct/run_20261002-120000_laptop_3050ti

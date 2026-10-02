@@ -27,7 +27,7 @@ from models.models import load_qwen_vl, load_yolo_model
 from utils.dataset_parser import parse_all_datasets, save_dataset_json
 from utils.augmentor import get_augmentor
 from utils.metrics import TextMetrics, TrainingMetrics
-from utils.visualization import plot_training_curves, save_history, save_summary
+from utils.visualization import plot_final_metrics, plot_training_curves, save_history, save_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -533,6 +533,11 @@ def infer_stage(cfg: PipelineConfig) -> None:
             json.dump(metrics, f, indent=2)
         logger.info(format_metrics_table(metrics, "INFERENCE METRICS"))
         logger.info(f"Metrics saved to {metrics_file}")
+
+        os.makedirs(cfg.plots_dir, exist_ok=True)
+        plot_file = os.path.join(cfg.plots_dir, "inference_metrics.png")
+        if plot_final_metrics(metrics, plot_file, f"Inference metrics ({len(results)} samples)"):
+            logger.info(f"Metrics chart saved to {plot_file}")
 
 
 def main():

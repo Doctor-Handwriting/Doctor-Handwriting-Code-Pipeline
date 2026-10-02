@@ -1,6 +1,18 @@
+import os
 from dataclasses import dataclass, field
-from typing import Literal, List
+from pathlib import Path
+from typing import Literal, List, Optional
 import torch
+
+
+# All paths are resolved relative to the repository root, so the project runs on any machine
+# as long as the folder structure is kept:
+#   <repo>/Dataset/DHP/...  and  <repo>/Dataset/RxHand/...
+# Override locations without editing code via environment variables:
+#   VLM_DATASET_ROOT=/mnt/data/Dataset   VLM_OUTPUT_DIR=/mnt/runs
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATASET_ROOT = Path(os.environ.get("VLM_DATASET_ROOT", PROJECT_ROOT / "Dataset")).resolve()
+OUTPUT_ROOT = Path(os.environ.get("VLM_OUTPUT_DIR", PROJECT_ROOT / "runs")).resolve()
 
 
 @dataclass
@@ -48,20 +60,56 @@ class TrainingConfig:
 @dataclass
 class DatasetConfig:
     """Dataset paths and processing parameters."""
-    dataset_root: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset"
-    dhp_root: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\DHP"
-    dhp_labels: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\DHP\doctor_handwriting_labels.csv"
-    dhp_images: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\DHP\img\img"
+    dataset_root: str = DATASET_ROOT.as_posix()
+    # Sub-paths left empty are derived from dataset_root in __post_init__.
+    dhp_root: str = ""
+    dhp_labels: str = ""
+    dhp_images: str = ""
 
-    rxhand_root: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\RxHand"
-    rxhand_train_labels: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\RxHand\Train_Label.csv"
-    rxhand_test_labels: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\RxHand\Test_Labels.csv"
-    rxhand_train_images: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\RxHand\Train_Set"
-    rxhand_test_images: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\Dataset\RxHand\Test_Set"
+    rxhand_root: str = ""
+    rxhand_train_labels: str = ""
+    rxhand_test_labels: str = ""
+    rxhand_train_images: str = ""
+    rxhand_test_images: str = ""
 
     train_split: float = 0.85
     val_split: float = 0.15
     max_samples: int = None
+
+    def __post_init__(self):
+        root = Path(self.dataset_root)
+        self.dhp_root = self.dhp_root or (root / "DHP").as_posix()
+        self.dhp_labels = self.dhp_labels or (Path(self.dhp_root) / "doctor_handwriting_labels.csv").as_posix()
+        self.dhp_images = self.dhp_images or (Path(self.dhp_root) / "img" / "img").as_posix()
+
+        self.rxhand_root = self.rxhand_root or (root / "RxHand").as_posix()
+        rx = Path(self.rxhand_root)
+        self.rxhand_train_labels = self.rxhand_train_labels or (rx / "Train_Label.csv").as_posix()
+        self.rxhand_test_labels = self.rxhand_test_labels or (rx / "Test_Labels.csv").as_posix()
+        self.rxhand_train_images = self.rxhand_train_images or (rx / "Train_Set").as_posix()
+        self.rxhand_test_images = self.rxhand_test_images or (rx / "Test_Set").as_posix()
+
+    def missing_paths(self) -> List[str]:
+        """Return expected dataset files/folders that do not exist."""
+        paths = [
+            self.dhp_labels, self.dhp_images,
+            self.rxhand_train_labels, self.rxhand_test_labels,
+            self.rxhand_train_images, self.rxhand_test_images,
+        ]
+        return [p for p in paths if not os.path.exists(p)]
+
+
+@dataclass
+class EvaluationConfig:
+    """Generation-based evaluation (WER/CER/accuracy) settings."""
+    # Val samples decoded with model.generate at every eval step during training.
+    # Generation is slow, so keep this small on a 4GB GPU; None = full val set.
+    train_eval_samples: Optional[int] = 50
+    # Val samples used by the "infer" stage; None = full val set.
+    infer_samples: Optional[int] = None
+    max_new_tokens: int = 64
+    # Adapter loaded by the "infer" stage (defaults to <checkpoint_dir>/final).
+    adapter_path: str = ""
 
 
 @dataclass
@@ -103,16 +151,22 @@ class PipelineConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
-    output_dir: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\runs"
-    checkpoint_dir: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\runs\checkpoints"
-    log_dir: str = r"D:\Data_D\All Programming Language\2_Doctor Prescription\runs\logs"
+    output_dir: str = OUTPUT_ROOT.as_posix()
+    # Left empty -> derived from output_dir in __post_init__.
+    checkpoint_dir: str = ""
+    log_dir: str = ""
     save_steps: int = 100
     eval_steps: int = 100
     log_steps: int = 10
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        self.checkpoint_dir = self.checkpoint_dir or (Path(self.output_dir) / "checkpoints").as_posix()
+        self.log_dir = self.log_dir or (Path(self.output_dir) / "logs").as_posix()
+        self.evaluation.adapter_path = self.evaluation.adapter_path or (Path(self.checkpoint_dir) / "final").as_posix()
+
         if self.model_type != self.model.model_type:
             self.model.model_type = self.model_type
         if self.stage != "infer" and self.training.per_device_train_batch_size > 1:

@@ -5,7 +5,7 @@ from transformers import (
     AutoProcessor,
     BitsAndBytesConfig
 )
-from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig, TaskType
+from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig, TaskType, PeftModel
 from ultralytics import YOLO
 import logging
 
@@ -41,13 +41,15 @@ def _get_qwen_model_class(version: str):
 LORA_TARGET_REGEX = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 
 
-def load_qwen_vl(cfg):
+def load_qwen_vl(cfg, adapter_path: str = None):
     """
     Load Qwen-VL model with 4-bit quantization and LoRA adaptation.
     Supports both Qwen 2.5-VL and Qwen 3-VL models.
 
     Args:
         cfg: PipelineConfig object with quantization and LoRA settings
+        adapter_path: If given, load this trained LoRA adapter for inference
+            instead of attaching a fresh trainable one.
 
     Returns:
         model, processor: Quantized and LoRA-adapted model and processor
@@ -76,6 +78,11 @@ def load_qwen_vl(cfg):
 
     processor = AutoProcessor.from_pretrained(checkpoint)
     processor.tokenizer.padding_side = "right"
+
+    if adapter_path:
+        logger.info(f"Loading trained LoRA adapter from {adapter_path}")
+        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
+        return model, processor
 
     model = prepare_model_for_kbit_training(
         model,

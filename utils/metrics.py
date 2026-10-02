@@ -56,12 +56,43 @@ class TextMetrics:
         return accuracy
 
     @staticmethod
+    def _normalize(text: str) -> str:
+        """Lowercase and collapse whitespace for lenient matching."""
+        return " ".join(str(text).lower().split())
+
+    @staticmethod
     def compute_batch_metrics(predictions: List[str], references: List[str]) -> Dict[str, float]:
-        """Compute all text metrics at once."""
+        """
+        Compute all text metrics at once.
+
+        wer/cer/mer/wil: error rates (lower is better).
+        accuracy: exact match; accuracy_normalized: case/whitespace-insensitive match;
+        char_accuracy: 1 - CER clipped to [0, 1] (higher is better).
+        """
+        if not predictions or not references:
+            return {}
+
+        predictions = [str(p).strip() for p in predictions]
+        references = [str(r).strip() for r in references]
+
+        # jiwer rejects empty references; substitute a placeholder so those samples count as errors.
+        safe_refs = [r if r else "<empty>" for r in references]
+        word_out = jiwer.process_words(safe_refs, predictions)
+        cer = jiwer.cer(safe_refs, predictions)
+
+        norm_matches = sum(
+            TextMetrics._normalize(p) == TextMetrics._normalize(r)
+            for p, r in zip(predictions, references)
+        )
+
         return {
-            "wer": TextMetrics.compute_wer(predictions, references),
-            "cer": TextMetrics.compute_cer(predictions, references),
+            "wer": word_out.wer,
+            "cer": cer,
+            "mer": word_out.mer,
+            "wil": word_out.wil,
             "accuracy": TextMetrics.compute_accuracy(predictions, references),
+            "accuracy_normalized": norm_matches / len(references),
+            "char_accuracy": max(0.0, 1.0 - cer),
         }
 
 

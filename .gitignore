@@ -27,6 +27,16 @@ runs/
 *.safetensors
 *.bin
 *.log
+events.out.tfevents.*
+nohup.out
+wandb/
+
+# Model / library caches (if HF_HOME or similar is pointed inside the repo)
+.cache/
+hf_cache/
+
+# Claude Code local settings
+.claude/settings.local.json
 
 # Local editor and OS files
 .vscode/

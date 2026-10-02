@@ -42,12 +42,38 @@ source venv/Scripts/activate  # Windows
 # or
 source venv/bin/activate      # Linux/Mac
 
+# For CUDA support, install torch matching your GPU driver first, e.g.
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 # Install dependencies
 pip install -r requirements.txt
-
-# For CUDA support (RTX 3050 Ti)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
+
+## Dataset Location (any machine)
+
+`Dataset/` is not committed to git. After cloning, copy it into the repo root with the same structure:
+
+```
+<repo>/Dataset/
+├── DHP/
+│   ├── doctor_handwriting_labels.csv
+│   └── img/img/
+└── RxHand/
+    ├── Train_Label.csv
+    ├── Test_Labels.csv
+    ├── Train_Set/
+    └── Test_Set/
+```
+
+All paths are resolved relative to the repo, so no code edits are needed. To keep the data or outputs elsewhere, set environment variables instead:
+
+```bash
+export VLM_DATASET_ROOT=/mnt/data/Dataset   # Linux/Mac
+export VLM_OUTPUT_DIR=/mnt/data/runs        # optional, defaults to <repo>/runs
+$env:VLM_DATASET_ROOT = "E:\Dataset"        # Windows PowerShell
+```
+
+`main.py` checks these paths on startup and lists any missing files.
 
 ## Quick Start
 
@@ -167,11 +193,23 @@ tensorboard --logdir runs/logs
 - Best model in `runs/checkpoints/final`
 - Resume training from checkpoint (automatic)
 
-### Metrics
-- **WER** (Word Error Rate): Lower is better
-- **CER** (Character Error Rate): Lower is better  
-- **Accuracy**: Exact match %
+### Progress & Metrics
+Training shows a progress bar with live `loss`, `lr`, `grad_norm` and the latest eval metrics.
+Every `eval_steps` a table of all evaluation metrics is printed and logged to TensorBoard;
+the final evaluation is saved to `runs/eval_metrics.json`. The infer stage evaluates the
+trained adapter (`runs/checkpoints/final`) on the validation set and writes
+`runs/inference_results.json` (per sample) and `runs/inference_metrics.json`.
+
+- **eval_loss**: Validation loss (teacher-forced)
+- **WER / MER / WIL**: Word error / match error / word information lost rates — lower is better
+- **CER** (Character Error Rate): Lower is better
+- **char_accuracy**: 1 − CER — higher is better
+- **accuracy**: Exact match %; **accuracy_normalized**: case/whitespace-insensitive match %
 - **mAP** (for YOLO): Mean Average Precision @IoU=0.5
+
+WER/CER/accuracy require `model.generate`, which is slow, so during training they are computed on
+`cfg.evaluation.train_eval_samples` (default 50) val samples. On a bigger GPU set it higher or to
+`None` for the whole val set; `cfg.evaluation.infer_samples` controls the infer stage.
 
 ## Training Tips
 
@@ -206,7 +244,7 @@ tensorboard --logdir runs/logs
 - Use SSD/NVMe for dataset (avoid network drives)
 
 ### Missing Dataset Files
-- Verify paths in `configs/config.py` match your setup
+- Make sure `Dataset/` sits in the repo root, or set `VLM_DATASET_ROOT` (see "Dataset Location")
 - Check `.trashed-*` files are being filtered
 - Run with `cfg.dataset.max_samples = 10` to debug
 

@@ -1,12 +1,16 @@
-# Install CUDA-enabled torch first for your GPU/driver, e.g.:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Install CUDA-enabled torch FIRST, then `pip install -r requirements.txt`.
+# The same cu128 build works on both machines (RTX 5070 / Blackwell sm_120 requires it;
+# it also supports the RTX 3050 Ti). Needs NVIDIA driver >= 570:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# If the laptop driver is older than 570, use cu126 there instead:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
-torch>=2.2.0
-torchvision>=0.17.0
+torch>=2.7.0  # first release with Blackwell (RTX 50xx) support
+torchvision>=0.22.0
 transformers>=4.57.0  # Qwen3VLForConditionalGeneration (Qwen3-VL) needs >=4.57
 accelerate>=0.30.0
 peft>=0.10.0
-bitsandbytes>=0.43.0
+bitsandbytes>=0.45.3  # sm_120 (RTX 50xx) kernels; used by the laptop 4-bit profile
 ultralytics>=8.3.0
 albumentations>=1.4.0
 stringzilla>=3.10.4,<4.0.0

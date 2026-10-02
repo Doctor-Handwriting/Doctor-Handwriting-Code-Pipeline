@@ -43,7 +43,7 @@ LORA_TARGET_REGEX = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj
 
 def load_qwen_vl(cfg, adapter_path: str = None):
     """
-    Load Qwen-VL model with 4-bit quantization and LoRA adaptation.
+    Load Qwen-VL model (4-bit quantized or full bf16/fp16, per hardware profile) with LoRA.
     Supports both Qwen 2.5-VL and Qwen 3-VL models.
 
     Args:
@@ -58,22 +58,26 @@ def load_qwen_vl(cfg, adapter_path: str = None):
     version = _detect_qwen_version(checkpoint)
     model_class = _get_qwen_model_class(version)
 
+    quantize = cfg.quantization.load_in_4bit
+    compute_dtype = cfg.quantization.bnb_4bit_compute_dtype
+
     logger.info(f"Detected Qwen version: {version}")
-    logger.info(f"Loading {checkpoint} with 4-bit quantization...")
+    logger.info(f"Loading {checkpoint} "
+                f"{'with 4-bit quantization' if quantize else f'in {compute_dtype} (no quantization)'}...")
 
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=cfg.quantization.load_in_4bit,
+        load_in_4bit=True,
         bnb_4bit_quant_type=cfg.quantization.bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=cfg.quantization.bnb_4bit_compute_dtype,
+        bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=cfg.quantization.bnb_4bit_use_double_quant,
-    )
+    ) if quantize else None
 
     # Pin everything to GPU 0: "auto" may offload to CPU, which breaks training.
     model = model_class.from_pretrained(
         checkpoint,
         quantization_config=bnb_config,
         device_map={"": 0},
-        torch_dtype=cfg.quantization.bnb_4bit_compute_dtype,
+        torch_dtype=compute_dtype,
     )
 
     processor = AutoProcessor.from_pretrained(checkpoint)
@@ -84,11 +88,16 @@ def load_qwen_vl(cfg, adapter_path: str = None):
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
         return model, processor
 
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=cfg.model.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-    )
+    if quantize:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=cfg.model.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+    elif cfg.model.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        # Frozen base weights: inputs must require grad for checkpointed LoRA layers to backprop.
+        model.enable_input_require_grads()
 
     lora_config = LoraConfig(
         r=cfg.lora.r,

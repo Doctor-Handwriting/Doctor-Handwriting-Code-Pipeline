@@ -72,8 +72,8 @@ class DatasetConfig:
     rxhand_train_images: str = ""
     rxhand_test_images: str = ""
 
-    train_split: float = 0.85
-    val_split: float = 0.15
+    train_split: float = 0.80
+    val_split: float = 0.20 
     max_samples: int = None
 
     def __post_init__(self):

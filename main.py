@@ -17,7 +17,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from configs.config import PipelineConfig
+from configs.config import PipelineConfig, HARDWARE_PROFILES
 from models.models import load_qwen_vl, load_yolo_model
 from utils.dataset_parser import parse_all_datasets, save_dataset_json
 from utils.augmentor import get_augmentor
@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 STAGE = "train"  # Options: "augment", "train", "infer"
 MODEL_CHOICE = "qwen-vl" #Options: "qwen-vl" or "yolo"
+# Options: "auto"          -> pick by detected GPU VRAM
+#          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
+#          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (bf16 LoRA, batch 4x2)
+# Profiles are defined in configs/config.py (HARDWARE_PROFILES).
+HARDWARE_PROFILE = "auto"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -424,8 +429,8 @@ def infer_stage(cfg: PipelineConfig) -> None:
     sample_records = val_records[:n_samples] if n_samples else val_records
     logger.info(f"Evaluating on {len(sample_records)} validation samples")
 
-    use_amp = cfg.training.use_fp16 and torch.cuda.is_available()
-    with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+    use_amp = torch.cuda.is_available()
+    with torch.autocast("cuda", dtype=cfg.compute_dtype, enabled=use_amp):
         metrics, results = run_generation_eval(
             model, processor, sample_records, cfg.model.max_pixels,
             cfg.evaluation.max_new_tokens, desc="Running inference",
@@ -451,6 +456,7 @@ def main():
     cfg = PipelineConfig(
         stage=STAGE,
         model_type=MODEL_CHOICE,
+        hardware_profile=HARDWARE_PROFILE,
     )
 
     logger.info("\n" + "=" * 60)
@@ -458,6 +464,11 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Stage: {cfg.stage}")
     logger.info(f"Model: {cfg.model_type}")
+    logger.info(f"Hardware profile: {cfg.hardware_profile} "
+                f"({HARDWARE_PROFILES[cfg.hardware_profile].description})")
+    logger.info(f"Precision: {cfg.mixed_precision}, 4-bit: {cfg.quantization.load_in_4bit}, "
+                f"batch: {cfg.training.per_device_train_batch_size} x "
+                f"{cfg.training.gradient_accumulation_steps} accum, workers: {cfg.training.num_workers}")
     logger.info(f"Device: {cfg.device}")
     logger.info(f"GPU Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():

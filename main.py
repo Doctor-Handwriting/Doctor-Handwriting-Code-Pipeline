@@ -1,7 +1,11 @@
 import os
 import sys
-import torch
 import logging
+
+# Triton is optional (not shipped on Windows); silence the warning repeated by every dataloader worker.
+logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+
+import torch
 import tracemalloc
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -359,6 +363,8 @@ def train_stage(cfg: PipelineConfig) -> None:
         bf16=cfg.training.use_bf16,
         dataloader_num_workers=cfg.training.num_workers,
         dataloader_pin_memory=cfg.training.pin_memory,
+        # Windows spawns workers slowly (~6s each); keep them alive across epochs/evals.
+        dataloader_persistent_workers=cfg.training.num_workers > 0,
         gradient_checkpointing=cfg.training.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=cfg.training.max_grad_norm,
@@ -470,6 +476,7 @@ def main():
                 f"batch: {cfg.training.per_device_train_batch_size} x "
                 f"{cfg.training.gradient_accumulation_steps} accum, workers: {cfg.training.num_workers}")
     logger.info(f"Device: {cfg.device}")
+    logger.info(f"PyTorch: {torch.__version__} (CUDA build: {torch.version.cuda or 'none - CPU only'})")
     logger.info(f"GPU Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -477,6 +484,19 @@ def main():
     logger.info(f"Dataset root: {cfg.dataset.dataset_root}")
     logger.info(f"Output dir: {cfg.output_dir}")
     logger.info("=" * 60 + "\n")
+
+    # Fail fast (before downloading the model) when the GPU is not usable.
+    if cfg.stage in ("train", "infer") and cfg.device == "cuda" and not torch.cuda.is_available():
+        logger.error("CUDA GPU not available to PyTorch - the model cannot be loaded.")
+        if torch.version.cuda is None:
+            logger.error("This PyTorch is a CPU-only build. Reinstall a CUDA build, e.g. for RTX 50xx:\n"
+                         "  pip uninstall -y torch torchvision\n"
+                         "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128")
+        else:
+            logger.error(f"PyTorch was built for CUDA {torch.version.cuda} but cannot reach the GPU. "
+                         "Check `nvidia-smi` works and the NVIDIA driver is recent enough "
+                         "(CUDA 12.8 builds need driver >= 570).")
+        sys.exit(1)
 
     missing = cfg.dataset.missing_paths()
     if missing:

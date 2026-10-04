@@ -58,7 +58,7 @@ HARDWARE_PROFILES = {
         compute_dtype=torch.bfloat16,
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=4, #2, 4, 6
         gradient_checkpointing=True,
         num_workers=4,
         pin_memory=True,
@@ -95,14 +95,15 @@ class QuantizationConfig:
 @dataclass
 class LoRAConfig:
     """Low-Rank Adaptation configuration for parameter-efficient fine-tuning."""
-    r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
+    r: int = 16  #8, 16 
+    lora_alpha: int = 32 #16, 32
+    lora_dropout: float = 0.2 #0.05, 0.15, 0.2 
     bias: str = "none"
     task_type: str = "CAUSAL_LM"
     target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj"
+        # "q_proj", "k_proj", "v_proj", "o_proj",
+        # "gate_proj", "up_proj", "down_proj"
+        "q_proj", "v_proj", "o_proj"
     ])
 
 
@@ -113,14 +114,14 @@ class TrainingConfig:
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
     num_epochs: int = 3
-    learning_rate: float = 1e-4
-    warmup_steps: int = 100
-    weight_decay: float = 0.01
+    learning_rate: float = 5e-5
+    warmup_steps: int = 150 #100, 150
+    weight_decay: float = 0.05 #0.01, 0.05
     max_grad_norm: float = 1.0
     num_workers: int = 2
     pin_memory: bool = False
-    use_bf16: bool = False
-    use_fp16: bool = True
+    use_bf16: bool = True         # Set to True since your 5070 natively rocks bf16
+    use_fp16: bool = False        # Turn off fp16 when using bf16
     gradient_checkpointing: bool = True
     seed: int = 42
 

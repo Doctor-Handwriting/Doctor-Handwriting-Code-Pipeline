@@ -29,7 +29,7 @@ vlm_pipeline/
 │   └── visualization.py   # Loss/accuracy/CER/WER/LR training plots
 ├── runs/                  # Outputs, one folder per model per run
 │   ├── train_augmented.json, val_augmented.json   # augment stage
-│   └── <model_name>/                               # e.g. Qwen3-VL-2B-Instruct
+│   └── <model_name>/                               # e.g. Qwen3-VL-8B-Instruct
 │       └── run_<YYYYmmdd-HHMMSS>_<profile>/
 │           ├── checkpoints/        # checkpoint-*/ and final/ (LoRA adapter)
 │           ├── logs/               # TensorBoard events

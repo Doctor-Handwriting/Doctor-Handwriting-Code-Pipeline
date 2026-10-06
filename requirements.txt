@@ -10,7 +10,7 @@ torchvision>=0.22.0
 transformers>=4.57.0  # Qwen3VLForConditionalGeneration (Qwen3-VL) needs >=4.57
 accelerate>=0.30.0
 peft>=0.10.0
-bitsandbytes>=0.45.3  # sm_120 (RTX 50xx) kernels; used by the laptop 4-bit profile
+bitsandbytes>=0.45.3  # 4-bit quantization (NF4); sm_120 (RTX 50xx) kernels for pc_5070
 ultralytics>=8.3.0
 albumentations>=1.4.0
 stringzilla>=3.10.4,<4.0.0

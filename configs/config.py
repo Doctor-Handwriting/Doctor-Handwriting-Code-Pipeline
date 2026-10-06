@@ -31,6 +31,12 @@ class HardwareProfile:
     max_pixels: int
     train_eval_samples: Optional[int]
     allow_tf32: bool
+    # kbit_upcast_fp32: run peft's prepare_model_for_kbit_training, which upcasts every non-quantized
+    #   weight (embeddings, lm_head) to fp32 - costs ~5GB extra on an 8B model, so off for the 12GB GPU.
+    # quantize_vision: also 4-bit quantize the vision tower; False keeps it in bf16 (better
+    #   handwriting features for ~0.6GB more VRAM).
+    kbit_upcast_fp32: bool = True
+    quantize_vision: bool = True
 
 
 # Select one in main.py via HARDWARE_PROFILE (or "auto" to pick by detected VRAM).
@@ -52,19 +58,24 @@ HARDWARE_PROFILES = {
         allow_tf32=False,
     ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
+    # Sized for Qwen3-VL-8B: bf16 weights alone are ~16GB, so it runs as QLoRA (NF4 weights ~6-7GB,
+    # bf16 compute, vision tower kept in bf16). Batch 2 x accum 4 = the paper's effective batch of 8;
+    # if CUDA OOM, drop to 1 x 8 (same effective batch).
     "pc_5070": HardwareProfile(
-        description="RTX 5070 12GB / 32GB RAM - bf16 LoRA (no quantization)",
-        load_in_4bit=False,
+        description="RTX 5070 12GB / 32GB RAM - Qwen3-VL-8B QLoRA (NF4 + bf16 compute)",
+        load_in_4bit=True,
         compute_dtype=torch.bfloat16,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        gradient_accumulation_steps=4, #2, 4, 6
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=4,
         gradient_checkpointing=True,
         num_workers=4,
         pin_memory=True,
         max_pixels=768 * 768,
         train_eval_samples=100,
         allow_tf32=True,
+        kbit_upcast_fp32=False,
+        quantize_vision=False,
     ),
 }
 
@@ -90,14 +101,18 @@ class QuantizationConfig:
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_compute_dtype: torch.dtype = torch.float16
     bnb_4bit_use_double_quant: bool = True
+    # Set from the hardware profile (see HardwareProfile for what they do).
+    upcast_fp32: bool = True
+    quantize_vision: bool = True
 
 
 @dataclass
 class LoRAConfig:
-    """Low-Rank Adaptation configuration for parameter-efficient fine-tuning."""
-    r: int = 16  #8, 16 
-    lora_alpha: int = 32 #16, 32
-    lora_dropout: float = 0.2 #0.05, 0.15, 0.2 
+    """Low-Rank Adaptation configuration for parameter-efficient fine-tuning.
+    r / alpha / dropout follow Table 1 of the VLM handwriting fine-tuning paper (rank 32, alpha 64, dropout 0.05)."""
+    r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
     bias: str = "none"
     task_type: str = "CAUSAL_LM"
     target_modules: List[str] = field(default_factory=lambda: [
@@ -109,21 +124,32 @@ class LoRAConfig:
 
 @dataclass
 class TrainingConfig:
-    """Training hyperparameters optimized for 4GB VRAM."""
+    """Training hyperparameters. Batch/accumulation/precision are overwritten by the hardware profile;
+    the rest follows Table 1 of the paper (7B/8B tier: 10 epochs, lr 2e-4, 8-bit AdamW,
+    cosine with restarts, weight decay 0.01, seed 3407)."""
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
-    num_epochs: int = 3
-    learning_rate: float = 5e-5
-    warmup_steps: int = 150 #100, 150
-    weight_decay: float = 0.05 #0.01, 0.05
+    num_epochs: int = 10
+    learning_rate: float = 2e-4
+    # Paper uses 2000 warmup steps on a far larger synthetic set; here an epoch is only ~560 optimizer
+    # steps (~4.5k train images / batch 8), so warm up over ~5% of the 10-epoch run instead.
+    warmup_steps: int = 300
+    weight_decay: float = 0.01
+    optim: str = "adamw_bnb_8bit"  # 8-bit AdamW (bitsandbytes); "adamw_torch" for plain AdamW
+    lr_scheduler_type: str = "cosine_with_restarts"
+    lr_scheduler_num_cycles: int = 2  # one warm restart halfway; paper does not state the cycle count
+    # Keep the checkpoint with the lowest val loss (small dataset + 10 epochs can overfit late),
+    # and keep only the newest few so a long run does not fill the disk.
+    load_best_model_at_end: bool = True
+    save_total_limit: int = 3
     max_grad_norm: float = 1.0
     num_workers: int = 2
     pin_memory: bool = False
     use_bf16: bool = True         # Set to True since your 5070 natively rocks bf16
     use_fp16: bool = False        # Turn off fp16 when using bf16
     gradient_checkpointing: bool = True
-    seed: int = 42
+    seed: int = 3407
 
 
 @dataclass
@@ -198,7 +224,7 @@ class AugmentationConfig:
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
     model_type: Literal["qwen-vl", "yolo"] = "qwen-vl"
-    qwen_checkpoint: str = "Qwen/Qwen3-VL-2B-Instruct"
+    qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
     yolo_checkpoint: str = "yolov8n.pt"
     max_pixels: int = 512 * 512
     min_pixels: int = 256 * 256
@@ -282,6 +308,8 @@ class PipelineConfig:
 
         self.quantization.load_in_4bit = hw.load_in_4bit
         self.quantization.bnb_4bit_compute_dtype = hw.compute_dtype
+        self.quantization.upcast_fp32 = hw.kbit_upcast_fp32
+        self.quantization.quantize_vision = hw.quantize_vision
         self.mixed_precision = "bf16" if use_bf16 else "fp16"
 
         t = self.training

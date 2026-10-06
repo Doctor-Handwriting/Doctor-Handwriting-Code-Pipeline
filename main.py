@@ -40,9 +40,9 @@ STAGE = "train"  # Options: "augment", "train", "infer"
 MODEL_CHOICE = "qwen-vl" #Options: "qwen-vl" or "yolo"
 # Options: "auto"          -> pick by detected GPU VRAM
 #          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
-#          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (bf16 LoRA, batch 4x2)
+#          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
-HARDWARE_PROFILE = "laptop_3050ti"
+HARDWARE_PROFILE = "pc_5070"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -107,6 +107,8 @@ def run_generation_eval(model, processor, records: List[Dict], max_pixels: int,
             "prompt": prompt,
             "generated_text": generated_text,
             "ground_truth": ground_truth,
+            "correct": TextMetrics.is_match(generated_text, ground_truth),
+            "correct_normalized": TextMetrics.is_match(generated_text, ground_truth, normalized=True),
             "cer": TextMetrics.compute_cer([generated_text], [ground_truth]) if ground_truth else None,
         })
 
@@ -127,6 +129,11 @@ def format_metrics_table(metrics: Dict, title: str) -> str:
     for key, value in rows:
         shown = f"{value:.4f}" if isinstance(value, float) else str(value)
         lines.append(f" {key:<{width}}{shown:>12}")
+    # Ground truth / correctly predicted, e.g. 100/97 when 3 of 100 samples are wrong.
+    for label, normalized in (("gt/pred (exact)", False), ("gt/pred (normalized)", True)):
+        pair = TextMetrics.format_gt_pred(metrics, normalized)
+        if pair:
+            lines.append(f" {label:<{width}}{pair:>12}")
     lines.append("=" * (width + 14))
     return "\n".join(lines)
 
@@ -163,6 +170,9 @@ class MetricsProgressCallback(ProgressCallback):
                 value = logs[key]
                 short = key.replace("learning_rate", "lr").replace("token_accuracy", "tok_acc")
                 self.postfix[short] = f"{value:.3g}" if isinstance(value, float) else value
+        gt_pred = TextMetrics.format_gt_pred(logs)
+        if gt_pred:
+            self.postfix["gt/pred"] = gt_pred
         if bar is not None:
             bar.set_postfix(self.postfix, refresh=True)
 
@@ -428,12 +438,20 @@ def train_stage(cfg: PipelineConfig) -> None:
         learning_rate=cfg.training.learning_rate,
         warmup_steps=cfg.training.warmup_steps,
         weight_decay=cfg.training.weight_decay,
+        optim=cfg.training.optim,
+        lr_scheduler_type=cfg.training.lr_scheduler_type,
+        lr_scheduler_kwargs={"num_cycles": cfg.training.lr_scheduler_num_cycles}
+        if cfg.training.lr_scheduler_type == "cosine_with_restarts" else {},
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         logging_steps=cfg.log_steps,
         eval_strategy="steps",
         eval_steps=cfg.eval_steps,
         save_steps=cfg.save_steps,
         save_strategy="steps",
+        save_total_limit=cfg.training.save_total_limit,
+        load_best_model_at_end=cfg.training.load_best_model_at_end,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         fp16=cfg.training.use_fp16,
         bf16=cfg.training.use_bf16,
         dataloader_num_workers=cfg.training.num_workers,
@@ -470,6 +488,8 @@ def train_stage(cfg: PipelineConfig) -> None:
 
     logger.info("Running final evaluation...")
     final_metrics = trainer.evaluate()
+    final_metrics["eval_gt_pred"] = TextMetrics.format_gt_pred(final_metrics)
+    final_metrics["eval_gt_pred_normalized"] = TextMetrics.format_gt_pred(final_metrics, normalized=True)
     metrics_file = os.path.join(cfg.run_dir, "eval_metrics.json")
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2)
@@ -527,11 +547,12 @@ def infer_stage(cfg: PipelineConfig) -> None:
     logger.info(f"Inference complete. Results saved to {output_file}")
 
     if metrics:
-        metrics["num_samples"] = len(results)
         metrics_file = os.path.join(cfg.run_dir, "inference_metrics.json")
+        logger.info(format_metrics_table(metrics, "INFERENCE METRICS"))
+        metrics["gt_pred"] = TextMetrics.format_gt_pred(metrics)
+        metrics["gt_pred_normalized"] = TextMetrics.format_gt_pred(metrics, normalized=True)
         with open(metrics_file, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
-        logger.info(format_metrics_table(metrics, "INFERENCE METRICS"))
         logger.info(f"Metrics saved to {metrics_file}")
 
         os.makedirs(cfg.plots_dir, exist_ok=True)

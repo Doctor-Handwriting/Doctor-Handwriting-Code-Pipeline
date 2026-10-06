@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 import jiwer
 import numpy as np
 from collections import defaultdict
@@ -61,6 +61,26 @@ class TextMetrics:
         return " ".join(str(text).lower().split())
 
     @staticmethod
+    def is_match(prediction: str, reference: str, normalized: bool = False) -> bool:
+        """True when the prediction equals the ground truth (exact, or case/whitespace-insensitive)."""
+        prediction, reference = str(prediction).strip(), str(reference).strip()
+        if normalized:
+            return TextMetrics._normalize(prediction) == TextMetrics._normalize(reference)
+        return prediction == reference
+
+    @staticmethod
+    def format_gt_pred(metrics: Dict, normalized: bool = False) -> Optional[str]:
+        """"<ground truth>/<correctly predicted>" counts, e.g. "100/97" when 3 of 100 samples are wrong.
+        Reads num_samples / num_correct (or the *_normalized variant) from a metrics dict,
+        with or without the "eval_" prefix. Returns None when the counts are absent."""
+        correct_key = "num_correct_normalized" if normalized else "num_correct"
+        for prefix in ("eval_", ""):
+            total, correct = metrics.get(f"{prefix}num_samples"), metrics.get(f"{prefix}{correct_key}")
+            if total is not None and correct is not None:
+                return f"{int(total)}/{int(correct)}"
+        return None
+
+    @staticmethod
     def compute_batch_metrics(predictions: List[str], references: List[str]) -> Dict[str, float]:
         """
         Compute all text metrics at once.
@@ -68,6 +88,8 @@ class TextMetrics:
         wer/cer/mer/wil: error rates (lower is better).
         accuracy: exact match; accuracy_normalized: case/whitespace-insensitive match;
         char_accuracy: 1 - CER clipped to [0, 1] (higher is better).
+        num_samples / num_correct / num_correct_normalized: raw counts behind the two accuracies
+        (see format_gt_pred for the "100/97" display).
         """
         if not predictions or not references:
             return {}
@@ -80,10 +102,9 @@ class TextMetrics:
         word_out = jiwer.process_words(safe_refs, predictions)
         cer = jiwer.cer(safe_refs, predictions)
 
-        norm_matches = sum(
-            TextMetrics._normalize(p) == TextMetrics._normalize(r)
-            for p, r in zip(predictions, references)
-        )
+        exact_matches = sum(TextMetrics.is_match(p, r) for p, r in zip(predictions, references))
+        norm_matches = sum(TextMetrics.is_match(p, r, normalized=True)
+                           for p, r in zip(predictions, references))
 
         return {
             "wer": word_out.wer,
@@ -93,6 +114,9 @@ class TextMetrics:
             "accuracy": TextMetrics.compute_accuracy(predictions, references),
             "accuracy_normalized": norm_matches / len(references),
             "char_accuracy": max(0.0, 1.0 - cer),
+            "num_samples": len(references),
+            "num_correct": exact_matches,
+            "num_correct_normalized": norm_matches,
         }
 
 

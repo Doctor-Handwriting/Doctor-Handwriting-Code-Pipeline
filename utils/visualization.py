@@ -15,6 +15,8 @@ from typing import Dict, List, Optional, Tuple
 from matplotlib.figure import Figure
 from matplotlib.ticker import PercentFormatter
 
+from utils.metrics import TextMetrics
+
 logger = logging.getLogger(__name__)
 
 HISTORY_JSON = "metrics_history.json"
@@ -49,7 +51,9 @@ METRIC_LABELS = {
 LOWER_IS_BETTER = {"loss", "cer", "wer", "mer", "wil"}
 NOT_PERCENT = {"loss"}
 # Trainer bookkeeping logged with every evaluation; not model quality metrics.
-NON_METRICS = {"runtime", "samples_per_second", "steps_per_second", "epoch", "num_samples"}
+# The sample counts are shown as "ground truth/predicted" in chart titles instead.
+NON_METRICS = {"runtime", "samples_per_second", "steps_per_second", "epoch",
+               "num_samples", "num_correct", "num_correct_normalized"}
 
 
 def _label(metric: str) -> str:
@@ -168,7 +172,11 @@ def plot_evaluation_metrics(history: List[Dict], path: Path) -> bool:
 def plot_final_metrics(metrics: Dict, path: str, title: str) -> bool:
     """Horizontal bar charts of one set of results (e.g. the final evaluation or the infer stage),
     split into "higher is better" and "lower is better" panels. Keys may carry an "eval_" prefix.
-    Loss is left out: it is not a 0-1 rate, so it would distort the shared axis."""
+    Loss is left out: it is not a 0-1 rate, so it would distort the shared axis.
+    When the metrics carry sample counts, the title ends with "ground truth/predicted" (e.g. 100/97)."""
+    gt_pred = TextMetrics.format_gt_pred(metrics)
+    if gt_pred:
+        title = f"{title} | ground truth/predicted: {gt_pred}"
     # A training-history entry also carries step/epoch/etc.: then only its eval_ keys are metrics.
     if any(k.startswith("eval_") for k in metrics):
         metrics = {k[5:]: v for k, v in metrics.items() if k.startswith("eval_")}

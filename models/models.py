@@ -65,11 +65,15 @@ def load_qwen_vl(cfg, adapter_path: str = None):
     logger.info(f"Loading {checkpoint} "
                 f"{'with 4-bit quantization' if quantize else f'in {compute_dtype} (no quantization)'}...")
 
+    # Naming "visual" here keeps the vision tower in compute_dtype. Passing a list replaces
+    # transformers' automatic lm_head exclusion, so lm_head is listed explicitly.
+    skip_modules = None if cfg.quantization.quantize_vision else ["lm_head", "visual"]
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type=cfg.quantization.bnb_4bit_quant_type,
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=cfg.quantization.bnb_4bit_use_double_quant,
+        llm_int8_skip_modules=skip_modules,
     ) if quantize else None
 
     # Pin everything to GPU 0: "auto" may offload to CPU, which breaks training.
@@ -88,13 +92,15 @@ def load_qwen_vl(cfg, adapter_path: str = None):
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
         return model, processor
 
-    if quantize:
+    if quantize and cfg.quantization.upcast_fp32:
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=cfg.model.gradient_checkpointing,
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
     elif cfg.model.gradient_checkpointing:
+        # Also the quantized path without fp32 upcast (8B on 12GB): same steps as prepare_model_for_kbit_training
+        # minus casting the embeddings/lm_head to fp32.
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         # Frozen base weights: inputs must require grad for checkpointed LoRA layers to backprop.
         model.enable_input_require_grads()

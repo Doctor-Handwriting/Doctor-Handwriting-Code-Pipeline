@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -37,10 +38,24 @@ class HardwareProfile:
     #   handwriting features for ~0.6GB more VRAM).
     kbit_upcast_fp32: bool = True
     quantize_vision: bool = True
+    # Largest Qwen checkpoint (billions of parameters, read from its name) that fits in bf16 on this GPU
+    # for LoRA training. Such models skip 4-bit quantization (better accuracy); bigger ones use NF4
+    # QLoRA when load_in_4bit is set. 0 = always quantize.
+    max_bf16_params_b: float = 0.0
+
+
+def qwen_params_billions(checkpoint: str) -> Optional[float]:
+    """Parameter count in billions parsed from a checkpoint name ("Qwen3-VL-8B-Instruct" -> 8.0),
+    or None when the name has no size (e.g. a local folder)."""
+    match = re.search(r"(\d+(?:\.\d+)?)[bB](?![a-zA-Z])", checkpoint.rstrip("/").split("/")[-1])
+    return float(match.group(1)) if match else None
 
 
 # Select one in main.py via HARDWARE_PROFILE (or "auto" to pick by detected VRAM).
-# Both keep an effective batch size of 8 so results stay comparable across machines.
+# All keep an effective batch size of 8 so results stay comparable across machines.
+# Model coverage per profile: qwen-vl uses the batch/precision/max_pixels below (quantization depends on the
+# checkpoint size, see max_bf16_params_b); crnn always uses its paper recipe (CRNNConfig, tiny memory
+# footprint, only num_workers/pin_memory come from here); yolo has no train/infer stage in this pipeline.
 HARDWARE_PROFILES = {
     # Laptop: Ryzen 7, 16GB RAM, RTX 3050 Ti 4GB
     "laptop_3050ti": HardwareProfile(
@@ -76,6 +91,28 @@ HARDWARE_PROFILES = {
         allow_tf32=True,
         kbit_upcast_fp32=False,
         quantize_vision=False,
+        max_bf16_params_b=3.0,  # 2B/3B: ~4-6GB bf16 weights fit; 4B+ (8GB+) is too tight with activations
+    ),
+    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 Ti 16GB (Blackwell, sm_120)
+    # 16GB leaves room for the paper's batch of 4 x 2 on Qwen3-VL-8B QLoRA (NF4 weights ~7GB incl. the
+    # bf16 vision tower), and lets Qwen3-VL-2B/4B train in plain bf16 (4B weights ~8GB).
+    # If CUDA OOM on 8B: batch 2 x accum 4, then 1 x 8 (same effective batch).
+    "pc_5070ti": HardwareProfile(
+        description="RTX 5070 Ti 16GB / 32GB RAM - Qwen3-VL-8B QLoRA (NF4 + bf16), 2B/4B in bf16",
+        load_in_4bit=True,
+        compute_dtype=torch.bfloat16,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=2,
+        gradient_checkpointing=True,
+        num_workers=4,
+        pin_memory=True,
+        max_pixels=768 * 768,
+        train_eval_samples=100,
+        allow_tf32=True,
+        kbit_upcast_fp32=False,
+        quantize_vision=False,
+        max_bf16_params_b=4.5,
     ),
 }
 
@@ -87,10 +124,13 @@ def find_latest_run(model_dir: Path) -> Optional[Path]:
 
 
 def detect_hardware_profile() -> str:
-    """Pick a profile from the detected GPU's VRAM (>=10GB -> pc_5070)."""
+    """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070).
+    A "16GB" card reports ~15.9GiB and a "12GB" one ~11.9GiB, hence the thresholds."""
     if not torch.cuda.is_available():
         return "laptop_3050ti"
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram_gb >= 14:
+        return "pc_5070ti"
     return "pc_5070" if vram_gb >= 10 else "laptop_3050ti"
 
 
@@ -221,9 +261,25 @@ class AugmentationConfig:
 
 
 @dataclass
+class CRNNConfig:
+    """CRNN from "Medical Handwritten Prescription Recognition Using CRNN" (Achkar et al., 2019):
+    13 VGG16 convolution layers -> 3 bidirectional LSTM layers -> CTC, trained from scratch.
+    Used when MODEL_CHOICE = "crnn"; replaces the LoRA/Qwen training recipe (see apply_crnn_recipe)."""
+    img_height: int = 64    # paper: text-line images normalized to 64px height
+    img_width: int = 340    # paper: 340x60 prescription crops; aspect-preserving resize + white padding
+    lstm_hidden: int = 256
+    lstm_layers: int = 3
+    batch_norm: bool = True  # not in the paper; makes a from-scratch VGG16+CTC stack train reliably
+    learning_rate: float = 5e-4  # paper: 0.0005
+    batch_size: int = 10         # paper: 10
+    num_epochs: int = 300        # paper: up to 1,000,000 but stops early (it took ~200)
+    early_stopping_patience: int = 20  # paper: stop after 20 epochs without improvement
+
+
+@dataclass
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
-    model_type: Literal["qwen-vl", "yolo"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo"] = "qwen-vl"
     qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
     yolo_checkpoint: str = "yolov8n.pt"
     max_pixels: int = 512 * 512
@@ -237,7 +293,7 @@ class PipelineConfig:
     """Master pipeline configuration."""
     stage: Literal["augment", "train", "infer"] = "train"
     hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
-    model_type: Literal["qwen-vl", "yolo"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo"] = "qwen-vl"
     device: str = "cuda"
     mixed_precision: str = "fp16"
 
@@ -247,6 +303,7 @@ class PipelineConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    crnn: CRNNConfig = field(default_factory=CRNNConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     output_dir: str = OUTPUT_ROOT.as_posix()
@@ -262,17 +319,24 @@ class PipelineConfig:
     save_steps: int = 100
     eval_steps: int = 100
     log_steps: int = 10
+    # Evaluate/checkpoint once per epoch instead of every eval_steps/save_steps (set for the CRNN recipe,
+    # whose early stopping counts epochs).
+    eval_by_epoch: bool = False
 
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.model_type != self.model.model_type:
             self.model.model_type = self.model_type
         self.apply_hardware_profile()
+        if self.model_type == "crnn":
+            self.apply_crnn_recipe()
         self.resolve_run_paths()
 
     @property
     def model_name(self) -> str:
-        """Folder name for the model, e.g. "Qwen3-VL-2B-Instruct" or "yolov8n"."""
+        """Folder name for the model, e.g. "Qwen3-VL-8B-Instruct", "CRNN" or "yolov8n"."""
+        if self.model_type == "crnn":
+            return "CRNN"
         if self.model_type == "yolo":
             name = Path(self.model.yolo_checkpoint).name
             return name[:-3] if name.endswith(".pt") else name
@@ -306,7 +370,10 @@ class PipelineConfig:
             hw = replace(hw, compute_dtype=torch.float16)
         use_bf16 = hw.compute_dtype == torch.bfloat16
 
-        self.quantization.load_in_4bit = hw.load_in_4bit
+        # Small enough to train in plain bf16? Then skip quantization (unknown size -> keep the profile default).
+        size_b = qwen_params_billions(self.model.qwen_checkpoint)
+        fits_bf16 = size_b is not None and size_b <= hw.max_bf16_params_b and hw.compute_dtype == torch.bfloat16
+        self.quantization.load_in_4bit = hw.load_in_4bit and not fits_bf16
         self.quantization.bnb_4bit_compute_dtype = hw.compute_dtype
         self.quantization.upcast_fp32 = hw.kbit_upcast_fp32
         self.quantization.quantize_vision = hw.quantize_vision
@@ -329,6 +396,31 @@ class PipelineConfig:
         if hw.allow_tf32 and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+    def apply_crnn_recipe(self) -> None:
+        """CRNN trains from scratch in fp32 with the paper's recipe (lr 5e-4, batch 10, early stopping),
+        so the Qwen/LoRA settings the hardware profile just applied are replaced. Worker count and
+        pin_memory still come from the profile."""
+        c, t = self.crnn, self.training
+        self.quantization.load_in_4bit = False
+        self.quantization.bnb_4bit_compute_dtype = torch.float32
+        self.mixed_precision = "fp32"
+
+        t.per_device_train_batch_size = c.batch_size
+        t.per_device_eval_batch_size = c.batch_size
+        t.gradient_accumulation_steps = 1
+        t.num_epochs = c.num_epochs
+        t.learning_rate = c.learning_rate
+        t.warmup_steps = 0
+        t.weight_decay = 0.0
+        t.optim = "adamw_torch"
+        t.lr_scheduler_type = "constant"
+        t.use_bf16 = t.use_fp16 = False
+        t.gradient_checkpointing = False
+        self.model.gradient_checkpointing = False
+
+        self.evaluation.train_eval_samples = None  # CRNN decoding is cheap: score the full val set
+        self.eval_by_epoch = True
 
     @property
     def compute_dtype(self) -> torch.dtype:

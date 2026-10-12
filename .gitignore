@@ -26,6 +26,10 @@ runs/
 *.ckpt
 *.safetensors
 *.bin
+# YOLO / export artifacts
+*.onnx
+*.engine
+*.torchscript
 *.log
 events.out.tfevents.*
 nohup.out

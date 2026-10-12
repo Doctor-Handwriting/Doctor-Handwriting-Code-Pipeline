@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import Trainer, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 from transformers.trainer_callback import ProgressCallback, TrainerCallback
 from transformers.integrations import TensorBoardCallback
 import json
@@ -22,8 +22,10 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from configs.config import PipelineConfig, HARDWARE_PROFILES
-from models.models import load_qwen_vl, load_yolo_model
+from configs.config import PipelineConfig, ModelConfig, HARDWARE_PROFILES
+from models.models import (
+    CRNNProcessor, build_charset, load_crnn, load_qwen_vl, load_yolo_model, save_crnn,
+)
 from utils.dataset_parser import parse_all_datasets, save_dataset_json
 from utils.augmentor import get_augmentor
 from utils.metrics import TextMetrics, TrainingMetrics
@@ -37,12 +39,22 @@ logger = logging.getLogger(__name__)
 
 
 STAGE = "train"  # Options: "augment", "train", "infer"
-MODEL_CHOICE = "qwen-vl" #Options: "qwen-vl" or "yolo"
+# Model to train / run inference with (no need to touch models.py or config.py):
+#   "qwen-vl" -> Qwen-VL fine-tuned with LoRA/QLoRA; the checkpoint is QWEN_CHECKPOINT below
+#   "crnn"    -> CRNN from the paper (13 VGG16 conv + 3 BiLSTM + CTC), trained from scratch with the
+#                paper's recipe (lr 5e-4, batch 10, early stopping); architecture settings: CRNNConfig
+MODEL_CHOICE = "qwen-vl"
+# Used when MODEL_CHOICE == "qwen-vl". Any Qwen2.5-VL / Qwen3-VL checkpoint, e.g.
+#   "Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"
+# (8B needs a 12GB+ profile and trains as 4-bit QLoRA; 2B/4B train in plain bf16 on pc_5070ti;
+#  use a 2B/3B model on the 4GB laptop).
+QWEN_CHECKPOINT = "Qwen/Qwen3-VL-8B-Instruct"
 # Options: "auto"          -> pick by detected GPU VRAM
 #          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
 #          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
+#          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
-HARDWARE_PROFILE = "pc_5070"
+HARDWARE_PROFILE = "pc_5070ti"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -71,6 +83,9 @@ def limit_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
 def generate_text(model, processor, image: Image.Image, prompt: str,
                   max_pixels: int, max_new_tokens: int) -> str:
     """Greedy-decode the model's transcription for a single image."""
+    if isinstance(processor, CRNNProcessor):
+        return processor.transcribe(model, image)
+
     text = processor.apply_chat_template(
         build_messages(prompt), tokenize=False, add_generation_prompt=True
     )
@@ -215,9 +230,12 @@ class GenerationEvalTrainer(Trainer):
     averaged over each logging window) and eval_token_accuracy (validation)."""
 
     def __init__(self, *args, processor=None, gen_eval_records=None,
-                 max_pixels: int = 512 * 512, max_new_tokens: int = 64, **kwargs):
+                 max_pixels: int = 512 * 512, max_new_tokens: int = 64,
+                 track_token_accuracy: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.processor = processor
+        # Next-token accuracy only makes sense for the autoregressive Qwen-VL (not CTC-based CRNN).
+        self.track_token_accuracy = track_token_accuracy
         self.gen_eval_records = gen_eval_records or []
         self.max_pixels = max_pixels
         self.max_new_tokens = max_new_tokens
@@ -229,7 +247,7 @@ class GenerationEvalTrainer(Trainer):
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
 
         logits = getattr(outputs, "logits", None)
-        if labels is not None and logits is not None:
+        if self.track_token_accuracy and labels is not None and logits is not None:
             with torch.no_grad():
                 preds = logits[:, :-1].argmax(dim=-1)
                 targets = labels[:, 1:].to(preds.device)
@@ -304,6 +322,21 @@ class QwenVLCollator:
         inputs["labels"] = labels
 
         return dict(inputs)
+
+
+class CRNNCollator:
+    """Image -> normalized grayscale tensor; text -> character ids padded with -100 (CTC targets)."""
+
+    def __init__(self, processor: CRNNProcessor):
+        self.processor = processor
+
+    def __call__(self, batch: List[Dict]) -> Dict:
+        pixel_values = torch.stack([self.processor.preprocess(item["image"]) for item in batch])
+        ids = [self.processor.encode(item["response"]) for item in batch]
+        labels = torch.full((len(ids), max(1, max(len(i) for i in ids))), -100, dtype=torch.long)
+        for row, row_ids in enumerate(ids):
+            labels[row, : len(row_ids)] = torch.tensor(row_ids, dtype=torch.long)
+        return {"pixel_values": pixel_values, "labels": labels}
 
 
 class VLMDataset(Dataset):
@@ -413,6 +446,11 @@ def train_stage(cfg: PipelineConfig) -> None:
     logger.info("Loading model and processor...")
     if cfg.model_type == "qwen-vl":
         model, processor = load_qwen_vl(cfg)
+        collator = QwenVLCollator(processor, cfg.model.max_pixels)
+    elif cfg.model_type == "crnn":
+        # CTC needs a fixed character set: every character that appears in any label.
+        model, processor = load_crnn(cfg, charset=build_charset(train_records + val_records))
+        collator = CRNNCollator(processor)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -444,10 +482,10 @@ def train_stage(cfg: PipelineConfig) -> None:
         if cfg.training.lr_scheduler_type == "cosine_with_restarts" else {},
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
         logging_steps=cfg.log_steps,
-        eval_strategy="steps",
+        eval_strategy="epoch" if cfg.eval_by_epoch else "steps",
         eval_steps=cfg.eval_steps,
         save_steps=cfg.save_steps,
-        save_strategy="steps",
+        save_strategy="epoch" if cfg.eval_by_epoch else "steps",
         save_total_limit=cfg.training.save_total_limit,
         load_best_model_at_end=cfg.training.load_best_model_at_end,
         metric_for_best_model="eval_loss",
@@ -472,16 +510,20 @@ def train_stage(cfg: PipelineConfig) -> None:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=QwenVLCollator(processor, cfg.model.max_pixels),
+        data_collator=collator,
         processor=processor,
         gen_eval_records=gen_eval_records,
         max_pixels=cfg.model.max_pixels,
         max_new_tokens=cfg.evaluation.max_new_tokens,
+        track_token_accuracy=cfg.model_type == "qwen-vl",
     )
     trainer.remove_callback(ProgressCallback)
     trainer.add_callback(MetricsProgressCallback())
     trainer.add_callback(TensorBoardCallback(tb_writer=SummaryWriter(log_dir=cfg.log_dir)))
     trainer.add_callback(TrainingPlotCallback(cfg.run_dir, cfg.plots_dir))
+    if cfg.model_type == "crnn" and cfg.crnn.early_stopping_patience > 0:
+        # Paper: stop once validation has not improved for 20 consecutive epochs (evals are per epoch).
+        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=cfg.crnn.early_stopping_patience))
 
     logger.info("Starting training...")
     trainer.train()
@@ -500,8 +542,12 @@ def train_stage(cfg: PipelineConfig) -> None:
     logger.info(f"Memory used - Allocated: {allocated_mb:.2f} MB, Peak: {peak_mb:.2f} MB")
     logger.info(f"Final GPU Memory: {mem_profiler.get_gpu_memory_mb():.2f} MB")
 
-    model.save_pretrained(os.path.join(cfg.checkpoint_dir, "final"))
-    logger.info(f"Model saved to {os.path.join(cfg.checkpoint_dir, 'final')}")
+    final_dir = os.path.join(cfg.checkpoint_dir, "final")
+    if cfg.model_type == "crnn":
+        save_crnn(model, processor, final_dir)
+    else:
+        model.save_pretrained(final_dir)
+    logger.info(f"Model saved to {final_dir}")
 
 
 def infer_stage(cfg: PipelineConfig) -> None:
@@ -515,12 +561,17 @@ def infer_stage(cfg: PipelineConfig) -> None:
 
     adapter_path = cfg.evaluation.adapter_path
     if not os.path.isdir(adapter_path):
+        if cfg.model_type == "crnn":
+            # An untrained CRNN is random; unlike Qwen there is no pretrained base model to fall back to.
+            raise FileNotFoundError(f"No trained CRNN at {adapter_path}. Run STAGE = \"train\" first.")
         logger.warning(f"No trained adapter at {adapter_path}; evaluating the base model")
         adapter_path = None
 
     logger.info("Loading model and processor...")
     if cfg.model_type == "qwen-vl":
         model, processor = load_qwen_vl(cfg, adapter_path=adapter_path)
+    elif cfg.model_type == "crnn":
+        model, processor = load_crnn(cfg, checkpoint_dir=adapter_path)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -533,7 +584,7 @@ def infer_stage(cfg: PipelineConfig) -> None:
     sample_records = val_records[:n_samples] if n_samples else val_records
     logger.info(f"Evaluating on {len(sample_records)} validation samples")
 
-    use_amp = torch.cuda.is_available()
+    use_amp = torch.cuda.is_available() and cfg.model_type == "qwen-vl"  # CRNN runs in fp32
     with torch.autocast("cuda", dtype=cfg.compute_dtype, enabled=use_amp):
         metrics, results = run_generation_eval(
             model, processor, sample_records, cfg.model.max_pixels,
@@ -567,13 +618,15 @@ def main():
         stage=STAGE,
         model_type=MODEL_CHOICE,
         hardware_profile=HARDWARE_PROFILE,
+        # Passed at construction: the run folder name is derived from the checkpoint.
+        model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT),
     )
 
     logger.info("\n" + "=" * 60)
     logger.info("VLM TRAINING PIPELINE")
     logger.info("=" * 60)
     logger.info(f"Stage: {cfg.stage}")
-    logger.info(f"Model: {cfg.model_type}")
+    logger.info(f"Model: {cfg.model_type} ({cfg.model_name})")
     logger.info(f"Hardware profile: {cfg.hardware_profile} "
                 f"({HARDWARE_PROFILES[cfg.hardware_profile].description})")
     logger.info(f"Precision: {cfg.mixed_precision}, 4-bit: {cfg.quantization.load_in_4bit}, "

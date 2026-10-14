@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from configs.config import PipelineConfig, ModelConfig, HARDWARE_PROFILES
 from models.models import (
-    CRNNProcessor, build_charset, load_crnn, load_qwen_vl, load_yolo_model, save_crnn,
+    CRNNProcessor, YOLOProcessor, build_charset, build_class_list, load_crnn, load_qwen_vl,
+    load_yolo_classifier, save_crnn, save_yolo,
 )
 from utils.dataset_parser import parse_all_datasets, save_dataset_json
 from utils.augmentor import get_augmentor
@@ -43,13 +44,21 @@ STAGE = "train"  # Options: "augment", "train", "infer"
 #   "qwen-vl" -> Qwen-VL fine-tuned with LoRA/QLoRA; the checkpoint is QWEN_CHECKPOINT below
 #   "crnn"    -> CRNN from the paper (13 VGG16 conv + 3 BiLSTM + CTC), trained from scratch with the
 #                paper's recipe (lr 5e-4, batch 10, early stopping); architecture settings: CRNNConfig
+#   "yolo"    -> Ultralytics YOLO *classification* net (YOLO_CHECKPOINT, a "-cls" model) used as a
+#                closed-vocabulary word recognizer: each distinct training label is a class and the
+#                predicted class is the transcription. It can never output a word absent from the
+#                training labels (~21% of validation words on the current split, so exact match tops
+#                out near 79%); settings: YOLOConfig. For free-form text use "qwen-vl" or "crnn".
 MODEL_CHOICE = "qwen-vl"
 # Used when MODEL_CHOICE == "qwen-vl". Any Qwen2.5-VL / Qwen3-VL checkpoint, e.g.
 #   "Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"
 # (8B needs a 12GB+ profile and trains as 4-bit QLoRA; 2B/4B train in plain bf16 on pc_5070ti;
 #  use a 2B/3B model on the 4GB laptop).
 QWEN_CHECKPOINT = "Qwen/Qwen3-VL-8B-Instruct"
-# Options: "auto"          -> pick by detected GPU VRAM
+# Used when MODEL_CHOICE == "yolo": must be a classification model, one of
+#   yolov8n-cls.pt | yolov8s-cls.pt | yolov8m-cls.pt | yolov8l-cls.pt | yolov8x-cls.pt
+YOLO_CHECKPOINT = "yolov8m-cls.pt"
+# Options: "auto"         -> pick by detected GPU VRAM
 #          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
 #          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
 #          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
@@ -83,7 +92,7 @@ def limit_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
 def generate_text(model, processor, image: Image.Image, prompt: str,
                   max_pixels: int, max_new_tokens: int) -> str:
     """Greedy-decode the model's transcription for a single image."""
-    if isinstance(processor, CRNNProcessor):
+    if isinstance(processor, (CRNNProcessor, YOLOProcessor)):
         return processor.transcribe(model, image)
 
     text = processor.apply_chat_template(
@@ -339,6 +348,20 @@ class CRNNCollator:
         return {"pixel_values": pixel_values, "labels": labels}
 
 
+class YOLOCollator:
+    """Image -> normalized RGB tensor; text -> class id (-100 when the word is not in the vocabulary)."""
+
+    def __init__(self, processor: YOLOProcessor):
+        self.processor = processor
+
+    def __call__(self, batch: List[Dict]) -> Dict:
+        return {
+            "pixel_values": torch.stack([self.processor.preprocess(item["image"]) for item in batch]),
+            "labels": torch.tensor([self.processor.class_index(item["response"]) for item in batch],
+                                   dtype=torch.long),
+        }
+
+
 class VLMDataset(Dataset):
     """Returns raw image + text; tokenization happens in QwenVLCollator."""
 
@@ -451,6 +474,16 @@ def train_stage(cfg: PipelineConfig) -> None:
         # CTC needs a fixed character set: every character that appears in any label.
         model, processor = load_crnn(cfg, charset=build_charset(train_records + val_records))
         collator = CRNNCollator(processor)
+    elif cfg.model_type == "yolo":
+        # Vocabulary = training labels only, so validation honestly counts unseen words as errors.
+        classes = build_class_list(train_records)
+        seen = set(classes)
+        unseen = sum(r["conversations"][1]["value"] not in seen for r in val_records)
+        logger.warning(f"YOLO classifier vocabulary: {len(classes)} words. {unseen} of {len(val_records)} "
+                       f"validation samples ({unseen / len(val_records):.1%}) have a word it has never seen "
+                       f"and will always count as wrong (exact match tops out at {1 - unseen / len(val_records):.1%}).")
+        model, processor = load_yolo_classifier(cfg, classes=classes)
+        collator = YOLOCollator(processor)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -521,9 +554,12 @@ def train_stage(cfg: PipelineConfig) -> None:
     trainer.add_callback(MetricsProgressCallback())
     trainer.add_callback(TensorBoardCallback(tb_writer=SummaryWriter(log_dir=cfg.log_dir)))
     trainer.add_callback(TrainingPlotCallback(cfg.run_dir, cfg.plots_dir))
-    if cfg.model_type == "crnn" and cfg.crnn.early_stopping_patience > 0:
-        # Paper: stop once validation has not improved for 20 consecutive epochs (evals are per epoch).
-        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=cfg.crnn.early_stopping_patience))
+    # Evaluation is per epoch for these models, so patience counts epochs without val-loss improvement
+    # (CRNN: 20 as in the paper).
+    patience = {"crnn": cfg.crnn.early_stopping_patience,
+                "yolo": cfg.yolo.early_stopping_patience}.get(cfg.model_type, 0)
+    if patience > 0:
+        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=patience))
 
     logger.info("Starting training...")
     trainer.train()
@@ -545,6 +581,8 @@ def train_stage(cfg: PipelineConfig) -> None:
     final_dir = os.path.join(cfg.checkpoint_dir, "final")
     if cfg.model_type == "crnn":
         save_crnn(model, processor, final_dir)
+    elif cfg.model_type == "yolo":
+        save_yolo(model, processor, Path(cfg.model.yolo_checkpoint).stem, final_dir)
     else:
         model.save_pretrained(final_dir)
     logger.info(f"Model saved to {final_dir}")
@@ -561,9 +599,11 @@ def infer_stage(cfg: PipelineConfig) -> None:
 
     adapter_path = cfg.evaluation.adapter_path
     if not os.path.isdir(adapter_path):
-        if cfg.model_type == "crnn":
-            # An untrained CRNN is random; unlike Qwen there is no pretrained base model to fall back to.
-            raise FileNotFoundError(f"No trained CRNN at {adapter_path}. Run STAGE = \"train\" first.")
+        if cfg.model_type in ("crnn", "yolo"):
+            # Unlike Qwen's adapter, these have no usable base model to fall back to (the CRNN is random,
+            # the YOLO classifier has no head for our vocabulary).
+            raise FileNotFoundError(f"No trained {cfg.model_type} model at {adapter_path}. "
+                                    f"Run STAGE = \"train\" first.")
         logger.warning(f"No trained adapter at {adapter_path}; evaluating the base model")
         adapter_path = None
 
@@ -572,6 +612,8 @@ def infer_stage(cfg: PipelineConfig) -> None:
         model, processor = load_qwen_vl(cfg, adapter_path=adapter_path)
     elif cfg.model_type == "crnn":
         model, processor = load_crnn(cfg, checkpoint_dir=adapter_path)
+    elif cfg.model_type == "yolo":
+        model, processor = load_yolo_classifier(cfg, checkpoint_dir=adapter_path)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -619,7 +661,7 @@ def main():
         model_type=MODEL_CHOICE,
         hardware_profile=HARDWARE_PROFILE,
         # Passed at construction: the run folder name is derived from the checkpoint.
-        model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT),
+        model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT, yolo_checkpoint=YOLO_CHECKPOINT),
     )
 
     logger.info("\n" + "=" * 60)

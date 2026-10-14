@@ -42,6 +42,9 @@ class HardwareProfile:
     # for LoRA training. Such models skip 4-bit quantization (better accuracy); bigger ones use NF4
     # QLoRA when load_in_4bit is set. 0 = always quantize.
     max_bf16_params_b: float = 0.0
+    # Per-device batch size when MODEL_CHOICE = "yolo" (small image classifier; VRAM is not the limit
+    # on the PCs). The CRNN keeps the paper's batch of 10 on every machine.
+    yolo_batch_size: int = 32
 
 
 def qwen_params_billions(checkpoint: str) -> Optional[float]:
@@ -71,6 +74,7 @@ HARDWARE_PROFILES = {
         max_pixels=512 * 512,
         train_eval_samples=50,
         allow_tf32=False,
+        yolo_batch_size=32,
     ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
     # Sized for Qwen3-VL-8B: bf16 weights alone are ~16GB, so it runs as QLoRA (NF4 weights ~6-7GB,
@@ -92,6 +96,7 @@ HARDWARE_PROFILES = {
         kbit_upcast_fp32=False,
         quantize_vision=False,
         max_bf16_params_b=3.0,  # 2B/3B: ~4-6GB bf16 weights fit; 4B+ (8GB+) is too tight with activations
+        yolo_batch_size=64,
     ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 Ti 16GB (Blackwell, sm_120)
     # 16GB leaves room for the paper's batch of 4 x 2 on Qwen3-VL-8B QLoRA (NF4 weights ~7GB incl. the
@@ -113,6 +118,7 @@ HARDWARE_PROFILES = {
         kbit_upcast_fp32=False,
         quantize_vision=False,
         max_bf16_params_b=4.5,
+        yolo_batch_size=128,
     ),
 }
 
@@ -277,11 +283,28 @@ class CRNNConfig:
 
 
 @dataclass
+class YOLOConfig:
+    """Ultralytics YOLO *classification* backbone used as a closed-vocabulary word recognizer:
+    every distinct training label is a class, and the predicted class name is the transcription.
+    Used when MODEL_CHOICE = "yolo". Fine-tunes ImageNet-pretrained weights; the batch size comes from
+    the hardware profile (yolo_batch_size)."""
+    imgsz: int = 224           # images are resized to imgsz x imgsz (ultralytics classification default)
+    learning_rate: float = 1e-3
+    weight_decay: float = 0.01
+    num_epochs: int = 50
+    warmup_steps: int = 100
+    label_smoothing: float = 0.1
+    early_stopping_patience: int = 10  # epochs without val-loss improvement
+
+
+@dataclass
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
     model_type: Literal["qwen-vl", "crnn", "yolo"] = "qwen-vl"
     qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
-    yolo_checkpoint: str = "yolov8n.pt"
+    # Must be an ultralytics *classification* checkpoint (name ends with "-cls"), e.g.
+    # yolov8n-cls.pt / yolov8s-cls.pt / yolov8m-cls.pt / yolov8l-cls.pt / yolov8x-cls.pt.
+    yolo_checkpoint: str = "yolov8m-cls.pt"
     max_pixels: int = 512 * 512
     min_pixels: int = 256 * 256
     max_seq_length: int = 512
@@ -304,6 +327,7 @@ class PipelineConfig:
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     crnn: CRNNConfig = field(default_factory=CRNNConfig)
+    yolo: YOLOConfig = field(default_factory=YOLOConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     output_dir: str = OUTPUT_ROOT.as_posix()
@@ -330,6 +354,8 @@ class PipelineConfig:
         self.apply_hardware_profile()
         if self.model_type == "crnn":
             self.apply_crnn_recipe()
+        elif self.model_type == "yolo":
+            self.apply_yolo_recipe()
         self.resolve_run_paths()
 
     @property
@@ -401,25 +427,45 @@ class PipelineConfig:
         """CRNN trains from scratch in fp32 with the paper's recipe (lr 5e-4, batch 10, early stopping),
         so the Qwen/LoRA settings the hardware profile just applied are replaced. Worker count and
         pin_memory still come from the profile."""
-        c, t = self.crnn, self.training
-        self.quantization.load_in_4bit = False
-        self.quantization.bnb_4bit_compute_dtype = torch.float32
-        self.mixed_precision = "fp32"
+        c = self.crnn
+        self._apply_small_model_recipe(
+            batch_size=c.batch_size, learning_rate=c.learning_rate, num_epochs=c.num_epochs,
+            weight_decay=0.0, warmup_steps=0, scheduler="constant", fp32=True)
 
-        t.per_device_train_batch_size = c.batch_size
-        t.per_device_eval_batch_size = c.batch_size
+    def apply_yolo_recipe(self) -> None:
+        """YOLO classifier fine-tunes pretrained weights with AdamW + cosine decay. Batch size comes from
+        the hardware profile; precision (bf16/fp16 autocast) stays as the profile set it."""
+        c = self.yolo
+        self._apply_small_model_recipe(
+            batch_size=HARDWARE_PROFILES[self.hardware_profile].yolo_batch_size,
+            learning_rate=c.learning_rate, num_epochs=c.num_epochs, weight_decay=c.weight_decay,
+            warmup_steps=c.warmup_steps, scheduler="cosine", fp32=False)
+
+    def _apply_small_model_recipe(self, *, batch_size: int, learning_rate: float, num_epochs: int,
+                                  weight_decay: float, warmup_steps: int, scheduler: str,
+                                  fp32: bool) -> None:
+        """Replace the Qwen/LoRA settings the hardware profile applied with those of a small image model
+        (CRNN, YOLO classifier): no quantization, no gradient accumulation, per-epoch evaluation."""
+        t = self.training
+        self.quantization.load_in_4bit = False
+        if fp32:
+            self.quantization.bnb_4bit_compute_dtype = torch.float32
+            self.mixed_precision = "fp32"
+            t.use_bf16 = t.use_fp16 = False
+
+        t.per_device_train_batch_size = batch_size
+        t.per_device_eval_batch_size = batch_size
         t.gradient_accumulation_steps = 1
-        t.num_epochs = c.num_epochs
-        t.learning_rate = c.learning_rate
-        t.warmup_steps = 0
-        t.weight_decay = 0.0
+        t.num_epochs = num_epochs
+        t.learning_rate = learning_rate
+        t.warmup_steps = warmup_steps
+        t.weight_decay = weight_decay
         t.optim = "adamw_torch"
-        t.lr_scheduler_type = "constant"
-        t.use_bf16 = t.use_fp16 = False
+        t.lr_scheduler_type = scheduler
         t.gradient_checkpointing = False
         self.model.gradient_checkpointing = False
 
-        self.evaluation.train_eval_samples = None  # CRNN decoding is cheap: score the full val set
+        self.evaluation.train_eval_samples = None  # decoding is cheap: score the full val set
         self.eval_by_epoch = True
 
     @property

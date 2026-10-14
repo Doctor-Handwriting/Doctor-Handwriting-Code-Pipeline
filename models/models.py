@@ -328,6 +328,132 @@ def load_crnn(cfg, charset: str = None, checkpoint_dir: str = None):
     return model, processor
 
 
+YOLO_CONFIG_FILE = "yolo_config.json"
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class YOLOClassifier(nn.Module):
+    """Ultralytics YOLO classification network as a plain nn.Module that follows the same contract as the
+    CRNN: forward(pixel_values, labels=None) -> {"logits", "loss"}, so the HF Trainer, early stopping and
+    the shared evaluation/plots work unchanged. Labels are class ids; -100 (a word that is not in the
+    training vocabulary) is ignored by the loss."""
+
+    def __init__(self, net: nn.Module, label_smoothing: float = 0.0):
+        super().__init__()
+        self.net = net
+        self.label_smoothing = label_smoothing
+
+    def forward(self, pixel_values, labels=None):
+        out = self.net(pixel_values)
+        # In eval mode the ultralytics Classify head returns (softmax probabilities, logits).
+        logits = out[1] if isinstance(out, (tuple, list)) else out
+        result = {"logits": logits}
+        if labels is not None:
+            labels = labels.to(logits.device)
+            if (labels != -100).any():
+                result["loss"] = F.cross_entropy(logits.float(), labels, ignore_index=-100,
+                                                 label_smoothing=self.label_smoothing)
+            else:  # batch made only of out-of-vocabulary words: nothing to learn from
+                result["loss"] = logits.float().sum() * 0.0
+        return result
+
+
+class YOLOProcessor:
+    """YOLO counterpart of the Qwen processor: image preprocessing and class-id <-> word mapping.
+    `classes` is the closed vocabulary (every distinct training label); the prediction for an image is
+    the name of its top-1 class, so words never seen in training cannot be produced."""
+
+    def __init__(self, classes: List[str], imgsz: int = 224):
+        self.classes = list(classes)
+        self.imgsz = imgsz
+        self._index = {c: i for i, c in enumerate(self.classes)}
+
+    def preprocess(self, image: Image.Image) -> torch.Tensor:
+        """RGB, resized to imgsz x imgsz, ImageNet-normalized (what the pretrained weights expect)."""
+        image = image.convert("RGB").resize((self.imgsz, self.imgsz), Image.BICUBIC)
+        pixels = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        mean = torch.tensor(_IMAGENET_MEAN).view(3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD).view(3, 1, 1)
+        return (pixels - mean) / std
+
+    def class_index(self, text: str) -> int:
+        """Class id of a label, or -100 (ignored by the loss) when it is outside the vocabulary."""
+        return self._index.get(text, -100)
+
+    @torch.no_grad()
+    def transcribe(self, model: YOLOClassifier, image: Image.Image) -> str:
+        device = next(model.parameters()).device
+        logits = model(pixel_values=self.preprocess(image).unsqueeze(0).to(device))["logits"]
+        return self.classes[int(logits.argmax(-1))]
+
+
+def build_class_list(records: List[Dict]) -> List[str]:
+    """Sorted distinct labels (conversations[1]) of the given records: the YOLO classifier's vocabulary."""
+    return sorted({r["conversations"][1]["value"] for r in records})
+
+
+def save_yolo(model: YOLOClassifier, processor: YOLOProcessor, arch: str, directory: str) -> None:
+    """Write weights + vocabulary; `arch` is the checkpoint stem (e.g. "yolov8m-cls") used to rebuild the net."""
+    os.makedirs(directory, exist_ok=True)
+    save_file({k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()},
+              os.path.join(directory, CRNN_WEIGHTS_FILE))
+    spec = {"classes": processor.classes, "imgsz": processor.imgsz, "arch": arch,
+            "label_smoothing": model.label_smoothing}
+    with open(os.path.join(directory, YOLO_CONFIG_FILE), "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2, ensure_ascii=False)
+
+
+def load_yolo_classifier(cfg, classes: List[str] = None, checkpoint_dir: str = None):
+    """
+    Build the YOLO word classifier: pretrained ImageNet weights with a new head (training), or
+    the architecture + weights written by save_yolo (inference).
+
+    Args:
+        cfg: PipelineConfig (cfg.model.yolo_checkpoint must be a "-cls" checkpoint when training)
+        classes: vocabulary; required when training
+        checkpoint_dir: if given, restore everything from it
+
+    Returns:
+        model, processor
+    """
+    from ultralytics.nn.tasks import ClassificationModel
+
+    arch = os.path.splitext(os.path.basename(cfg.model.yolo_checkpoint))[0]
+    if checkpoint_dir:
+        with open(os.path.join(checkpoint_dir, YOLO_CONFIG_FILE), encoding="utf-8") as f:
+            spec = json.load(f)
+        net = ClassificationModel(cfg=f"{spec['arch']}.yaml", nc=len(spec["classes"]), verbose=False)
+        model = YOLOClassifier(net, spec.get("label_smoothing", 0.0))
+        model.load_state_dict(load_file(os.path.join(checkpoint_dir, CRNN_WEIGHTS_FILE)))
+        processor = YOLOProcessor(spec["classes"], spec["imgsz"])
+        logger.info(f"Loaded YOLO classifier ({spec['arch']}) from {checkpoint_dir}")
+    else:
+        if not classes:
+            raise ValueError("A class list is required to build a new YOLO classifier")
+        net = YOLO(cfg.model.yolo_checkpoint).model
+        if not isinstance(net, ClassificationModel):
+            raise ValueError(
+                f"'{cfg.model.yolo_checkpoint}' is not an ultralytics classification checkpoint. This pipeline "
+                f"recognizes words by classification, so use a '-cls' model, e.g. yolov8m-cls.pt "
+                f"(set YOLO_CHECKPOINT in main.py).")
+        net = net.float()
+        # Checkpoints store EMA weights with requires_grad=False; make everything trainable again.
+        for p in net.parameters():
+            p.requires_grad_(True)
+        ClassificationModel.reshape_outputs(net, len(classes))
+        model = YOLOClassifier(net, cfg.yolo.label_smoothing)
+        processor = YOLOProcessor(classes, cfg.yolo.imgsz)
+        logger.info(f"Loaded pretrained {cfg.model.yolo_checkpoint} with a {len(classes)}-class head")
+
+    if cfg.device == "cuda":
+        model = model.to("cuda")
+    trainable, total = count_parameters(model)
+    logger.info(f"YOLO classifier ({arch}): {len(processor.classes)} classes, "
+                f"{trainable:,} trainable parameters ({total:,} total)")
+    return model, processor
+
+
 def count_parameters(model):
     """Return count of trainable and total parameters."""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -214,24 +214,48 @@ def save_dataset_json(records: List[Dict], output_path: str) -> None:
 
 def parse_all_datasets(cfg) -> Tuple[List[Dict], List[Dict]]:
     """
-    Parse all datasets (DHP + RxHand), merge, and split.
+    Parse the datasets selected by cfg.mode and split them into train/val.
 
     Args:
-        cfg: DatasetConfig object with all paths
+        cfg: DatasetConfig object with all paths. cfg.mode:
+            "combined" - DHP + RxHand merged into one pool, one split (default)
+            "dhp"      - DHP only, split on its own
+            "rxhand"   - RxHand only; split on its own, or with cfg.rxhand_official_split
+                         train = Train_Set, val = Test_Set
 
     Returns:
         Tuple of (train_records, val_records)
     """
-    dhp_records = load_dhp_dataset(cfg.dhp_labels, cfg.dhp_images)
+    mode = cfg.mode
+    logger.info(f"Dataset mode: {mode}" + (" (official RxHand train/test split)" if cfg.rxhand_official_split else ""))
 
-    rxhand_train, rxhand_test = load_rxhand_dataset(
-        cfg.rxhand_train_labels,
-        cfg.rxhand_test_labels,
-        cfg.rxhand_train_images,
-        cfg.rxhand_test_images,
-    )
+    dhp_records, rxhand_train, rxhand_test = [], [], []
+    if mode in ("combined", "dhp"):
+        dhp_records = load_dhp_dataset(cfg.dhp_labels, cfg.dhp_images)
+    if mode in ("combined", "rxhand"):
+        rxhand_train, rxhand_test = load_rxhand_dataset(
+            cfg.rxhand_train_labels,
+            cfg.rxhand_test_labels,
+            cfg.rxhand_train_images,
+            cfg.rxhand_test_images,
+        )
+
+    if cfg.rxhand_official_split:
+        if not rxhand_train or not rxhand_test:
+            raise ValueError("Official RxHand split needs both Train_Set and Test_Set records, found "
+                             f"{len(rxhand_train)} train / {len(rxhand_test)} test")
+        train_records, val_records = rxhand_train, rxhand_test
+        if cfg.max_samples:
+            n_train = max(1, int(cfg.max_samples * cfg.train_split))
+            train_records = train_records[:n_train]
+            val_records = val_records[:max(1, cfg.max_samples - n_train)]
+            logger.info(f"Limited dataset to {cfg.max_samples} samples")
+        logger.info(f"Official RxHand split: {len(train_records)} train, {len(val_records)} val")
+        return train_records, val_records
 
     all_records = merge_datasets(dhp_records, rxhand_train + rxhand_test)
+    if not all_records:
+        raise ValueError(f"No records found for dataset mode '{mode}'; check the dataset paths.")
 
     if cfg.max_samples:
         all_records = all_records[:cfg.max_samples]

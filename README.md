@@ -112,6 +112,8 @@ STAGE = "train"
 MODEL_CHOICE = "qwen-vl"  # or "crnn", "yolo", "yolo26"
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOICE = "yolo26"
 HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_5070", "auto"
+DATASET_MODE = "combined"  # or "dhp" / "rxhand" to train and validate on one dataset only
+RXHAND_OFFICIAL_SPLIT = False  # "rxhand" only: True = train on Train_Set, validate on Test_Set
 
 python main.py
 ```

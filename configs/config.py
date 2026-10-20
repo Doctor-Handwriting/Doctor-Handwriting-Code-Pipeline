@@ -244,11 +244,24 @@ class DatasetConfig:
     rxhand_train_images: str = ""
     rxhand_test_images: str = ""
 
+    # Which data is used (set DATASET_MODE in main.py):
+    #   "combined" -> DHP + RxHand merged into one pool, then one train/val split (default)
+    #   "dhp"      -> DHP only: its own train/val split, RxHand is ignored
+    #   "rxhand"   -> RxHand only: its own train/val split, DHP is ignored
+    mode: Literal["combined", "dhp", "rxhand"] = "combined"
+    # mode == "rxhand" only: train on RxHand's official Train_Set and validate on its Test_Set instead of
+    # re-splitting them together (the DHP dataset has no official split).
+    rxhand_official_split: bool = False
+
     train_split: float = 0.80
-    val_split: float = 0.20 
+    val_split: float = 0.20
     max_samples: int = None
 
     def __post_init__(self):
+        if self.mode not in ("combined", "dhp", "rxhand"):
+            raise ValueError(f"Unknown dataset mode '{self.mode}'. Options: combined, dhp, rxhand")
+        if self.rxhand_official_split and self.mode != "rxhand":
+            raise ValueError("rxhand_official_split only applies to dataset mode 'rxhand'")
         root = Path(self.dataset_root)
         self.dhp_root = self.dhp_root or (root / "DHP").as_posix()
         self.dhp_labels = self.dhp_labels or (Path(self.dhp_root) / "doctor_handwriting_labels.csv").as_posix()
@@ -261,13 +274,21 @@ class DatasetConfig:
         self.rxhand_train_images = self.rxhand_train_images or (rx / "Train_Set").as_posix()
         self.rxhand_test_images = self.rxhand_test_images or (rx / "Test_Set").as_posix()
 
+    @property
+    def mode_tag(self) -> str:
+        """Suffix for run folder names; empty for the default combined setup."""
+        if self.mode == "combined":
+            return ""
+        return f"_{self.mode}" + ("-official" if self.rxhand_official_split else "")
+
     def missing_paths(self) -> List[str]:
-        """Return expected dataset files/folders that do not exist."""
-        paths = [
-            self.dhp_labels, self.dhp_images,
-            self.rxhand_train_labels, self.rxhand_test_labels,
-            self.rxhand_train_images, self.rxhand_test_images,
-        ]
+        """Return expected dataset files/folders (of the datasets the mode uses) that do not exist."""
+        paths = []
+        if self.mode in ("combined", "dhp"):
+            paths += [self.dhp_labels, self.dhp_images]
+        if self.mode in ("combined", "rxhand"):
+            paths += [self.rxhand_train_labels, self.rxhand_test_labels,
+                      self.rxhand_train_images, self.rxhand_test_images]
         return [p for p in paths if not os.path.exists(p)]
 
 
@@ -436,7 +457,7 @@ class PipelineConfig:
         if not self.run_name:
             latest = find_latest_run(model_dir) if self.stage == "infer" else None
             self.run_name = latest.name if latest else (
-                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}")
+                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.dataset.mode_tag}")
         run = Path(self.run_dir or model_dir / self.run_name)
         self.run_dir = run.as_posix()
         self.checkpoint_dir = self.checkpoint_dir or (run / "checkpoints").as_posix()

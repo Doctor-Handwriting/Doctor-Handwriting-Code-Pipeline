@@ -22,7 +22,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from configs.config import PipelineConfig, ModelConfig, HARDWARE_PROFILES
+from configs.config import PipelineConfig, ModelConfig, DatasetConfig, HARDWARE_PROFILES
 from models.models import (
     CRNNProcessor, YOLOProcessor, build_charset, build_class_list, load_crnn, load_qwen_vl,
     load_yolo_classifier, save_crnn, save_yolo,
@@ -72,6 +72,15 @@ YOLO26_CHECKPOINT = "yolo26m-cls.pt"
 #          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
 HARDWARE_PROFILE = "pc_5070ti"
+# Which data to train and validate on:
+#   "combined" -> DHP + RxHand merged into one pool, then a single train/val split (default)
+#   "dhp"      -> DHP only, split into its own train/val
+#   "rxhand"   -> RxHand only, split into its own train/val
+# For "rxhand", RXHAND_OFFICIAL_SPLIT = True trains on RxHand's Train_Set and validates on its Test_Set
+# instead of re-splitting them together. Non-combined runs get the mode in their run folder name
+# (run_<timestamp>_<profile>_dhp), so separate experiments never overwrite each other.
+DATASET_MODE = "combined"
+RXHAND_OFFICIAL_SPLIT = False
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -668,7 +677,8 @@ def main():
         stage=STAGE,
         model_type=MODEL_CHOICE,
         hardware_profile=HARDWARE_PROFILE,
-        # Passed at construction: the run folder name is derived from the checkpoint.
+        # Passed at construction: the run folder name is derived from the checkpoint and dataset mode.
+        dataset=DatasetConfig(mode=DATASET_MODE, rxhand_official_split=RXHAND_OFFICIAL_SPLIT),
         model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT, yolo_checkpoint=YOLO_CHECKPOINT,
                           yolo26_checkpoint=YOLO26_CHECKPOINT),
     )

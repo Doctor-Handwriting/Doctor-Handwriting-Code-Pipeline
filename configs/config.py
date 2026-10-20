@@ -11,10 +11,11 @@ import torch
 # as long as the folder structure is kept:
 #   <repo>/Dataset/DHP/...  and  <repo>/Dataset/RxHand/...
 # Override locations without editing code via environment variables:
-#   VLM_DATASET_ROOT=/mnt/data/Dataset   VLM_OUTPUT_DIR=/mnt/runs
+#   VLM_DATASET_ROOT=/mnt/data/Dataset   VLM_OUTPUT_DIR=/mnt/runs   VLM_AUGMENTED_DIR=/mnt/data/Augmented_Dataset
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_ROOT = Path(os.environ.get("VLM_DATASET_ROOT", PROJECT_ROOT / "Dataset")).resolve()
 OUTPUT_ROOT = Path(os.environ.get("VLM_OUTPUT_DIR", PROJECT_ROOT / "runs")).resolve()
+AUGMENTED_ROOT = Path(os.environ.get("VLM_AUGMENTED_DIR", PROJECT_ROOT / "Augmented_Dataset")).resolve()
 
 
 @dataclass
@@ -308,6 +309,14 @@ class EvaluationConfig:
 @dataclass
 class AugmentationConfig:
     """Data augmentation parameters."""
+    # "online"  -> random transforms applied to each training image while training (nothing stored, new
+    #              variation every epoch)
+    # "offline" -> variants are pre-computed once by STAGE = "augment" into offline_root and training reads
+    #              them from there (fixed, inspectable, reproducible). Set AUGMENTATION_MODE in main.py.
+    mode: Literal["online", "offline"] = "online"
+    offline_root: str = AUGMENTED_ROOT.as_posix()
+    offline_include_mixed: bool = True  # offline: also write one variant with all six transforms applied together
+    offline_seed: int = 42              # offline: variants are deterministic for a given seed and settings
     enable_augmentation: bool = True
     motion_blur_prob: float = 0.3
     elastic_deform_prob: float = 0.3
@@ -316,6 +325,15 @@ class AugmentationConfig:
     rotation_limit: int = 15
     shift_limit: float = 0.1
     scale_limit: float = 0.2
+
+    def __post_init__(self):
+        if self.mode not in ("online", "offline"):
+            raise ValueError(f"Unknown augmentation mode '{self.mode}'. Options: online, offline")
+
+    @property
+    def mode_tag(self) -> str:
+        """Suffix for run folder names; empty for the default online augmentation."""
+        return "_offline" if self.mode == "offline" else ""
 
 
 @dataclass
@@ -457,7 +475,7 @@ class PipelineConfig:
         if not self.run_name:
             latest = find_latest_run(model_dir) if self.stage == "infer" else None
             self.run_name = latest.name if latest else (
-                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.dataset.mode_tag}")
+                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.dataset.mode_tag}{self.augmentation.mode_tag}")
         run = Path(self.run_dir or model_dir / self.run_name)
         self.run_dir = run.as_posix()
         self.checkpoint_dir = self.checkpoint_dir or (run / "checkpoints").as_posix()

@@ -22,12 +22,14 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from configs.config import PipelineConfig, ModelConfig, DatasetConfig, HARDWARE_PROFILES
+from configs.config import AugmentationConfig, PipelineConfig, ModelConfig, DatasetConfig, HARDWARE_PROFILES
 from models.models import (
     CRNNProcessor, YOLOProcessor, build_charset, build_class_list, load_crnn, load_qwen_vl,
     load_yolo_classifier, save_crnn, save_yolo,
 )
-from utils.dataset_parser import parse_all_datasets, save_dataset_json
+from utils.dataset_parser import (
+    apply_offline_dataset, build_offline_dataset, missing_offline_manifests, parse_all_datasets, save_dataset_json,
+)
 from utils.augmentor import get_augmentor
 from utils.metrics import TextMetrics, TrainingMetrics
 from utils.visualization import plot_final_metrics, plot_training_curves, save_history, save_summary
@@ -81,6 +83,17 @@ HARDWARE_PROFILE = "pc_5070ti"
 # (run_<timestamp>_<profile>_dhp), so separate experiments never overwrite each other.
 DATASET_MODE = "combined"
 RXHAND_OFFICIAL_SPLIT = False
+# How training images are augmented:
+#   "online"  -> random transforms applied to each training image on the fly (nothing stored on disk, a new
+#                variation every epoch, same behaviour as before)
+#   "offline" -> STAGE = "augment" first pre-computes the images into Augmented_Dataset/<DHP|RxHand>/
+#                (original/ copies + augmented/ <name>_<variant>.png: motionblur, elasticdeform, perspective,
+#                brightnesscontrast, rotate, shiftscalerotate, mixed + augmentation_manifest.json);
+#                STAGE = "train"/"infer" then read from there with no augmentation at train time. Only training
+#                images get variants (the split is made on the originals), validation uses originals.
+#                Training epochs get ~8x larger, so lower num_epochs accordingly. Offline runs get "_offline"
+#                in their run folder name.
+AUGMENTATION_MODE = "online"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -442,18 +455,29 @@ def setup_directories(*directories: str) -> None:
         logger.info(f"Directory ready: {directory}")
 
 
+def load_records(cfg: PipelineConfig) -> Tuple[List[Dict], List[Dict]]:
+    """Train/val records; in offline augmentation mode they point at the pre-computed Augmented_Dataset."""
+    train_records, val_records = parse_all_datasets(cfg.dataset)
+    if cfg.augmentation.mode == "offline":
+        train_records, val_records = apply_offline_dataset(
+            cfg.dataset, cfg.augmentation, train_records, val_records)
+    return train_records, val_records
+
+
 def augment_stage(cfg: PipelineConfig) -> None:
     """Stage 1: Generate augmented dataset."""
     logger.info("=" * 60)
-    logger.info("STAGE: AUGMENTATION")
+    logger.info(f"STAGE: AUGMENTATION ({cfg.augmentation.mode})")
     logger.info("=" * 60)
 
     setup_directories(cfg.output_dir)
 
-    logger.info("Parsing datasets...")
-    train_records, val_records = parse_all_datasets(cfg.dataset)
+    if cfg.augmentation.mode == "offline":
+        logger.info(f"Generating offline augmented dataset in {cfg.augmentation.offline_root}...")
+        build_offline_dataset(cfg.dataset, cfg.augmentation)
 
-    augmentor = get_augmentor(cfg.augmentation)
+    logger.info("Parsing datasets...")
+    train_records, val_records = load_records(cfg)
 
     output_train = os.path.join(cfg.output_dir, "train_augmented.json")
     output_val = os.path.join(cfg.output_dir, "val_augmented.json")
@@ -481,7 +505,7 @@ def train_stage(cfg: PipelineConfig) -> None:
     logger.info(f"Model: {cfg.model_type}")
 
     logger.info("Parsing datasets...")
-    train_records, val_records = parse_all_datasets(cfg.dataset)
+    train_records, val_records = load_records(cfg)
 
     logger.info("Loading model and processor...")
     if cfg.model_type == "qwen-vl":
@@ -506,7 +530,8 @@ def train_stage(cfg: PipelineConfig) -> None:
 
     logger.info(f"GPU Memory: {mem_profiler.get_gpu_memory_mb():.2f} MB")
 
-    augmentor = get_augmentor(cfg.augmentation)
+    # Offline: the training images are already augmented on disk, so nothing is applied here.
+    augmentor = get_augmentor(cfg.augmentation) if cfg.augmentation.mode == "online" else None
 
     train_dataset = VLMDataset(train_records, augmentor)
     val_dataset = VLMDataset(val_records)
@@ -637,7 +662,7 @@ def infer_stage(cfg: PipelineConfig) -> None:
     model.eval()
 
     logger.info("Parsing datasets...")
-    _, val_records = parse_all_datasets(cfg.dataset)
+    _, val_records = load_records(cfg)
 
     n_samples = cfg.evaluation.infer_samples
     sample_records = val_records[:n_samples] if n_samples else val_records
@@ -679,6 +704,7 @@ def main():
         hardware_profile=HARDWARE_PROFILE,
         # Passed at construction: the run folder name is derived from the checkpoint and dataset mode.
         dataset=DatasetConfig(mode=DATASET_MODE, rxhand_official_split=RXHAND_OFFICIAL_SPLIT),
+        augmentation=AugmentationConfig(mode=AUGMENTATION_MODE),
         model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT, yolo_checkpoint=YOLO_CHECKPOINT,
                           yolo26_checkpoint=YOLO26_CHECKPOINT),
     )
@@ -700,6 +726,8 @@ def main():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     logger.info(f"Dataset root: {cfg.dataset.dataset_root}")
+    logger.info(f"Dataset mode: {cfg.dataset.mode}, augmentation: {cfg.augmentation.mode}"
+                + (f" ({cfg.augmentation.offline_root})" if cfg.augmentation.mode == "offline" else ""))
     logger.info(f"Output dir: {cfg.output_dir}")
     if cfg.stage != "augment":
         logger.info(f"Run dir: {cfg.run_dir}")
@@ -724,6 +752,15 @@ def main():
         logger.error("Place the dataset at <repo>/Dataset (DHP/ and RxHand/) "
                      "or set the VLM_DATASET_ROOT environment variable.")
         sys.exit(1)
+
+    if cfg.augmentation.mode == "offline" and cfg.stage in ("train", "infer"):
+        absent = missing_offline_manifests(cfg.dataset, cfg.augmentation)
+        if absent:
+            logger.error("AUGMENTATION_MODE is \"offline\" but the augmented dataset is missing:\n  "
+                         + "\n  ".join(absent))
+            logger.error("Run once with STAGE = \"augment\" (same DATASET_MODE) to create it, "
+                         "or set AUGMENTATION_MODE = \"online\".")
+            sys.exit(1)
 
     if cfg.stage == "augment":
         augment_stage(cfg)

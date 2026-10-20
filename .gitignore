@@ -3,6 +3,7 @@ CLAUDE.md
 
 # Python environments and caches
 Dataset/
+Augmented_Dataset/
 .venv/
 venv/
 env/

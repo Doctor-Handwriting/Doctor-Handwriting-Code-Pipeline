@@ -212,6 +212,166 @@ def save_dataset_json(records: List[Dict], output_path: str) -> None:
     logger.info(f"Saved {len(records)} records to {output_path}")
 
 
+OFFLINE_MANIFEST = "augmentation_manifest.json"
+
+
+def get_augmented_dataset_paths(cfg, aug_cfg) -> Dict[str, Dict[str, str]]:
+    """
+    Offline-augmentation locations of the datasets selected by cfg.mode (DatasetConfig).
+
+    Returns {"DHP": {"source_root", "dir", "manifest"}, "RxHand": {...}}. dir is
+    <offline_root>/<dataset> and holds original/, augmented/ and the manifest.
+    """
+    sources = []
+    if cfg.mode in ("combined", "dhp"):
+        sources.append(("DHP", cfg.dhp_root))
+    if cfg.mode in ("combined", "rxhand"):
+        sources.append(("RxHand", cfg.rxhand_root))
+    return {
+        name: {
+            "source_root": root,
+            "dir": (Path(aug_cfg.offline_root) / name).as_posix(),
+            "manifest": (Path(aug_cfg.offline_root) / name / OFFLINE_MANIFEST).as_posix(),
+        }
+        for name, root in sources
+    }
+
+
+def missing_offline_manifests(cfg, aug_cfg) -> List[str]:
+    """Manifest files of the selected datasets that STAGE = "augment" has not created yet."""
+    return [d["manifest"] for d in get_augmented_dataset_paths(cfg, aug_cfg).values()
+            if not os.path.exists(d["manifest"])]
+
+
+def _all_dataset_images(cfg) -> Dict[str, List[str]]:
+    """Every usable image of each selected dataset, regardless of the train/val split."""
+    images = {}
+    if cfg.mode in ("combined", "dhp"):
+        images["DHP"] = [r["image"] for r in load_dhp_dataset(cfg.dhp_labels, cfg.dhp_images)]
+    if cfg.mode in ("combined", "rxhand"):
+        train, test = load_rxhand_dataset(
+            cfg.rxhand_train_labels, cfg.rxhand_test_labels, cfg.rxhand_train_images, cfg.rxhand_test_images)
+        images["RxHand"] = [r["image"] for r in train + test]
+    return images
+
+
+def _relative_image_path(image: str, source_root: str) -> str:
+    """Image path relative to its dataset root, with forward slashes ("Train_Set/P0001.jpg")."""
+    return Path(image).relative_to(Path(source_root)).as_posix()
+
+
+def build_offline_dataset(cfg, aug_cfg) -> None:
+    """
+    Pre-compute the offline augmented dataset for the datasets selected by cfg.mode:
+
+        <offline_root>/<DHP|RxHand>/original/...    copy of every original image
+        <offline_root>/<DHP|RxHand>/augmented/...   <name>_<variant>.png for every variant
+        <offline_root>/<DHP|RxHand>/augmentation_manifest.json
+
+    Covers every image of the dataset (not just today's training split), so changing the split or
+    max_samples later does not require regenerating.
+    """
+    from utils.augmentor import generate_offline_augmentations, offline_settings
+
+    if not aug_cfg.enable_augmentation:
+        raise ValueError("Offline augmentation needs enable_augmentation = True; nothing to generate.")
+
+    paths = get_augmented_dataset_paths(cfg, aug_cfg)
+    all_images = _all_dataset_images(cfg)
+    total_files = 0
+    total_bytes = 0
+
+    for name, info in paths.items():
+        pairs = [(img, _relative_image_path(img, info["source_root"])) for img in all_images[name]]
+        manifest = generate_offline_augmentations(aug_cfg, pairs, info["dir"], label=name)
+        with open(info["manifest"], "w", encoding="utf-8") as f:
+            json.dump({
+                "dataset": name,
+                "source_root": normalize_path(info["source_root"]),
+                "settings": offline_settings(aug_cfg),
+                "images": manifest,
+            }, f, indent=2, ensure_ascii=False)
+
+        folder_files = [os.path.join(d, f) for d, _, fs in os.walk(info["dir"]) for f in fs]
+        folder_bytes = sum(os.path.getsize(p) for p in folder_files)
+        total_files += len(folder_files)
+        total_bytes += folder_bytes
+        logger.info(f"{name}: {len(pairs)} originals + {sum(len(v) for v in manifest.values())} augmented "
+                    f"in {info['dir']} ({folder_bytes / 1024**2:.1f} MB)")
+
+    logger.info(f"Offline augmented dataset ready: {total_files} files, {total_bytes / 1024**2:.1f} MB "
+                f"in {aug_cfg.offline_root}")
+
+
+def apply_offline_dataset(cfg, aug_cfg, train_records: List[Dict],
+                          val_records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Point train/val records at the offline dataset.
+
+    The split is made on the original images first, so no augmented copy of a validation image can reach
+    training. Training gets each original (from original/) plus all its variants; validation gets only
+    the originals, so metrics stay comparable with online runs.
+    """
+    paths = get_augmented_dataset_paths(cfg, aug_cfg)
+    missing = missing_offline_manifests(cfg, aug_cfg)
+    if missing:
+        raise FileNotFoundError(
+            "Offline augmentation selected but the augmented dataset was not found:\n  " + "\n  ".join(missing)
+            + "\nRun with STAGE = \"augment\" (same DATASET_MODE) first, or set AUGMENTATION_MODE = \"online\".")
+
+    from utils.augmentor import offline_settings
+    manifests = {}
+    for name, info in paths.items():
+        with open(info["manifest"], "r", encoding="utf-8") as f:
+            manifests[name] = json.load(f)
+        if manifests[name].get("settings") != offline_settings(aug_cfg):
+            logger.warning(f"{name}: augmentation settings changed since {info['manifest']} was generated "
+                           f"(existing images are used as they are). Delete {info['dir']} and re-run "
+                           f"STAGE = \"augment\" to regenerate.")
+
+    def locate(record: Dict) -> Tuple[str, str]:
+        for name, info in paths.items():
+            try:
+                return name, _relative_image_path(record["image"], info["source_root"])
+            except ValueError:
+                continue
+        raise ValueError(f"{record['image']} is not inside a selected dataset")
+
+    def redirected(record: Dict, image_path: str, suffix: str = "") -> Dict:
+        return {**record, "id": record["id"] + suffix, "image": normalize_path(image_path)}
+
+    def expand(records: List[Dict], with_variants: bool) -> List[Dict]:
+        originals, variants, absent, unlisted = [], [], [], []
+        for record in records:
+            name, rel = locate(record)
+            ds_dir = paths[name]["dir"]
+            original = os.path.join(ds_dir, "original", rel)
+            if rel not in manifests[name]["images"] or not os.path.exists(original):
+                unlisted.append(record["image"])
+                continue
+            originals.append(redirected(record, original))
+            if with_variants:
+                for variant_rel in manifests[name]["images"][rel]:
+                    variant = os.path.join(ds_dir, variant_rel)
+                    if os.path.exists(variant):
+                        variant_name = os.path.splitext(variant_rel)[0].rsplit("_", 1)[1]
+                        variants.append(redirected(record, variant, f"__{variant_name}"))
+                    else:
+                        absent.append(variant)
+        if unlisted or absent:
+            examples = (unlisted + absent)[:3]
+            raise FileNotFoundError(
+                f"Offline dataset is incomplete: {len(unlisted)} images not in the manifest, "
+                f"{len(absent)} variant files missing (e.g. {examples}). Re-run STAGE = \"augment\".")
+        return originals + variants
+
+    train_out = expand(train_records, with_variants=True)
+    val_out = expand(val_records, with_variants=False)
+    logger.info(f"Offline augmentation: train {len(train_records)} originals -> {len(train_out)} images "
+                f"(originals + variants), val {len(val_out)} originals (no variants)")
+    return train_out, val_out
+
+
 def parse_all_datasets(cfg) -> Tuple[List[Dict], List[Dict]]:
     """
     Parse the datasets selected by cfg.mode and split them into train/val.

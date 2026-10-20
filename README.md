@@ -27,6 +27,9 @@ vlm_pipeline/
 │   ├── augmentor.py       # Medical handwriting augmentations
 │   ├── metrics.py         # WER, CER, accuracy, mAP computation
 │   └── visualization.py   # Loss/accuracy/CER/WER/LR training plots
+├── Augmented_Dataset/     # AUGMENTATION_MODE = "offline" only (created by STAGE = "augment", git-ignored)
+│   ├── DHP/    {original/, augmented/, augmentation_manifest.json}
+│   └── RxHand/ {original/, augmented/, augmentation_manifest.json}
 ├── runs/                  # Outputs, one folder per model per run
 │   ├── train_augmented.json, val_augmented.json   # augment stage
 │   └── <model_name>/                               # e.g. Qwen3-VL-8B-Instruct
@@ -114,9 +117,44 @@ YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOIC
 HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_5070", "auto"
 DATASET_MODE = "combined"  # or "dhp" / "rxhand" to train and validate on one dataset only
 RXHAND_OFFICIAL_SPLIT = False  # "rxhand" only: True = train on Train_Set, validate on Test_Set
+AUGMENTATION_MODE = "online"  # or "offline": pre-computed Augmented_Dataset/ (run STAGE = "augment" first)
 
 python main.py
 ```
+
+**Augmentation mode** (`AUGMENTATION_MODE` in `main.py`):
+
+| | `"online"` (default) | `"offline"` |
+|---|---|---|
+| What happens | random transforms applied to each training image while training | variants pre-computed once, training reads them from disk |
+| Extra disk | none | ~8x the images (measured 0.7 GB for DHP + RxHand: 0.2 GB DHP, 0.5 GB RxHand) |
+| Variety | new variation every epoch | fixed set of variants (reproducible, seeded) |
+| Inspect the augmented images | no | yes, browse `Augmented_Dataset/` |
+| Train epoch size | 1x | ~8x (original + 7 variants), so use fewer epochs |
+
+```python
+AUGMENTATION_MODE = "offline"
+STAGE = "augment"   # python main.py -> builds Augmented_Dataset/ (once; re-runs only fill in what is missing)
+STAGE = "train"     # python main.py -> trains on the pre-computed images; "infer" validates on them too
+```
+
+Offline layout (per dataset; paths below `original/` and `augmented/` mirror the dataset's own folders):
+```
+Augmented_Dataset/DHP/original/img/img/<name>.jpg                 copy of every original
+Augmented_Dataset/DHP/augmented/img/img/<name>_motionblur.png     and _elasticdeform, _perspective,
+                                                                  _brightnesscontrast, _rotate,
+                                                                  _shiftscalerotate, _mixed (all six together)
+Augmented_Dataset/DHP/augmentation_manifest.json                  original -> its variants, plus the settings used
+Augmented_Dataset/RxHand/{original,augmented}/{Train_Set,Test_Set}/...
+```
+Only training images get variants: the train/val split is made on the originals first, so no augmented copy of a
+validation image can leak into training, and validation scores stay comparable with online runs. Variants are
+generated for every image of the datasets selected by `DATASET_MODE`, so changing the split later needs no
+regeneration; a different `DATASET_MODE` needs `STAGE = "augment"` run once for it. Labels still come from
+`Dataset/`. To regenerate after changing the augmentation settings, delete `Augmented_Dataset/` and re-run
+the augment stage (a settings mismatch is warned about at train time). Offline runs get `_offline` in their run
+folder name. `VLM_AUGMENTED_DIR` moves the folder; `AugmentationConfig.offline_include_mixed = False` drops
+the `_mixed` variant.
 
 **YOLO26 (`MODEL_CHOICE = "yolo26"`)** fine-tunes the YOLO26 classification backbones
 (`yolo26{n,s,m,l,x}-cls.pt`, 3.6M-30.4M parameters) as a closed-vocabulary word recognizer: each distinct

@@ -109,10 +109,19 @@ python main.py
 ```bash
 # Edit main.py:
 STAGE = "train"
-MODEL_CHOICE = "qwen-vl"  # or "yolo"
+MODEL_CHOICE = "qwen-vl"  # or "crnn", "yolo", "yolo26"
+YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOICE = "yolo26"
+HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_5070", "auto"
 
 python main.py
 ```
+
+**YOLO26 (`MODEL_CHOICE = "yolo26"`)** fine-tunes the YOLO26 classification backbones
+(`yolo26{n,s,m,l,x}-cls.pt`, 3.6M-30.4M parameters) as a closed-vocabulary word recognizer: each distinct
+training label is a class. Ultralytics has no text-generating YOLO26 variant (the open-vocabulary YOLOE-26 models
+are box detectors), so classification is the only YOLO26 task that fits box-less word labels. Every size runs on
+all three profiles at the same effective batch (32 laptop / 64 `pc_5070` / 128 `pc_5070ti`); on the 4GB laptop
+`yolo26x` uses 16 x 2 gradient accumulation, everything else fits in one pass.
 
 **Inference Stage:**
 ```bash

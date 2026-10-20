@@ -410,7 +410,7 @@ def load_yolo_classifier(cfg, classes: List[str] = None, checkpoint_dir: str = N
     the architecture + weights written by save_yolo (inference).
 
     Args:
-        cfg: PipelineConfig (cfg.model.yolo_checkpoint must be a "-cls" checkpoint when training)
+        cfg: PipelineConfig (cfg.yolo_checkpoint must be a "-cls" checkpoint when training)
         classes: vocabulary; required when training
         checkpoint_dir: if given, restore everything from it
 
@@ -419,7 +419,8 @@ def load_yolo_classifier(cfg, classes: List[str] = None, checkpoint_dir: str = N
     """
     from ultralytics.nn.tasks import ClassificationModel
 
-    arch = os.path.splitext(os.path.basename(cfg.model.yolo_checkpoint))[0]
+    checkpoint, settings = cfg.yolo_checkpoint, cfg.yolo_settings
+    arch = os.path.splitext(os.path.basename(checkpoint))[0]
     if checkpoint_dir:
         with open(os.path.join(checkpoint_dir, YOLO_CONFIG_FILE), encoding="utf-8") as f:
             spec = json.load(f)
@@ -431,20 +432,20 @@ def load_yolo_classifier(cfg, classes: List[str] = None, checkpoint_dir: str = N
     else:
         if not classes:
             raise ValueError("A class list is required to build a new YOLO classifier")
-        net = YOLO(cfg.model.yolo_checkpoint).model
+        net = YOLO(checkpoint).model
         if not isinstance(net, ClassificationModel):
             raise ValueError(
-                f"'{cfg.model.yolo_checkpoint}' is not an ultralytics classification checkpoint. This pipeline "
-                f"recognizes words by classification, so use a '-cls' model, e.g. yolov8m-cls.pt "
-                f"(set YOLO_CHECKPOINT in main.py).")
+                f"'{checkpoint}' is not an ultralytics classification checkpoint. This pipeline "
+                f"recognizes words by classification, so use a '-cls' model, e.g. yolov8m-cls.pt or "
+                f"yolo26m-cls.pt (set YOLO_CHECKPOINT / YOLO26_CHECKPOINT in main.py).")
         net = net.float()
         # Checkpoints store EMA weights with requires_grad=False; make everything trainable again.
         for p in net.parameters():
             p.requires_grad_(True)
         ClassificationModel.reshape_outputs(net, len(classes))
-        model = YOLOClassifier(net, cfg.yolo.label_smoothing)
-        processor = YOLOProcessor(classes, cfg.yolo.imgsz)
-        logger.info(f"Loaded pretrained {cfg.model.yolo_checkpoint} with a {len(classes)}-class head")
+        model = YOLOClassifier(net, settings.label_smoothing)
+        processor = YOLOProcessor(classes, settings.imgsz)
+        logger.info(f"Loaded pretrained {checkpoint} with a {len(classes)}-class head")
 
     if cfg.device == "cuda":
         model = model.to("cuda")

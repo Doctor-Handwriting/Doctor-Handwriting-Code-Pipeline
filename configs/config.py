@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, List, Optional
+from typing import Dict, Literal, List, Optional
 import torch
 
 
@@ -45,6 +45,26 @@ class HardwareProfile:
     # Per-device batch size when MODEL_CHOICE = "yolo" (small image classifier; VRAM is not the limit
     # on the PCs). The CRNN keeps the paper's batch of 10 on every machine.
     yolo_batch_size: int = 32
+    # MODEL_CHOICE = "yolo26": largest per-device batch that fits for each YOLO26 size (n/s/m/l/x). The effective
+    # batch stays yolo_batch_size for every size; sizes that do not fit in one pass use gradient accumulation
+    # (e.g. 16 x 2 = 32). Measured on the 3050 Ti at 224px with fp16 autocast, see YOLO26_SIZES.
+    yolo26_micro_batch: Dict[str, int] = field(default_factory=dict)
+
+
+# YOLO26 classification checkpoints (ultralytics >= 8.4): yolo26{n,s,m,l,x}-cls.pt, ImageNet-pretrained.
+YOLO26_SIZES = ("n", "s", "m", "l", "x")
+
+
+def yolo26_size(checkpoint: str) -> str:
+    """Size letter of a YOLO26 classification checkpoint ("yolo26m-cls.pt" -> "m")."""
+    match = re.fullmatch(r"yolo26([nslmx])-cls(?:\.pt)?", Path(checkpoint).name)
+    if not match:
+        raise ValueError(
+            f"'{checkpoint}' is not a YOLO26 classification checkpoint. Use one of "
+            f"{', '.join(f'yolo26{s}-cls.pt' for s in YOLO26_SIZES)} (set YOLO26_CHECKPOINT in main.py). "
+            f"Detection/segmentation/pose checkpoints (yolo26n.pt, yolo26n-seg.pt, ...) and the open-vocabulary "
+            f"YOLOE-26 models cannot transcribe text without bounding-box labels.")
+    return match.group(1)
 
 
 def qwen_params_billions(checkpoint: str) -> Optional[float]:
@@ -58,7 +78,8 @@ def qwen_params_billions(checkpoint: str) -> Optional[float]:
 # All keep an effective batch size of 8 so results stay comparable across machines.
 # Model coverage per profile: qwen-vl uses the batch/precision/max_pixels below (quantization depends on the
 # checkpoint size, see max_bf16_params_b); crnn always uses its paper recipe (CRNNConfig, tiny memory
-# footprint, only num_workers/pin_memory come from here); yolo has no train/infer stage in this pipeline.
+# footprint, only num_workers/pin_memory come from here); yolo/yolo26 take their batch from yolo_batch_size
+# (yolo26 additionally splits it per model size with yolo26_micro_batch + gradient accumulation).
 HARDWARE_PROFILES = {
     # Laptop: Ryzen 7, 16GB RAM, RTX 3050 Ti 4GB
     "laptop_3050ti": HardwareProfile(
@@ -75,6 +96,10 @@ HARDWARE_PROFILES = {
         train_eval_samples=50,
         allow_tf32=False,
         yolo_batch_size=32,
+        # Peak reserved VRAM at 224px, fp16 (measured on this GPU): n 0.45GB, s 0.76, m 1.4, l 1.8 at batch 32;
+        # x 1.7GB at batch 16 (2.9GB at 32 leaves too little of the 4GB once Windows takes its share, and
+        # anything past ~4GB spills into shared system memory and trains 10x slower).
+        yolo26_micro_batch={"n": 32, "s": 32, "m": 32, "l": 32, "x": 16},
     ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
     # Sized for Qwen3-VL-8B: bf16 weights alone are ~16GB, so it runs as QLoRA (NF4 weights ~6-7GB,
@@ -97,6 +122,8 @@ HARDWARE_PROFILES = {
         quantize_vision=False,
         max_bf16_params_b=3.0,  # 2B/3B: ~4-6GB bf16 weights fit; 4B+ (8GB+) is too tight with activations
         yolo_batch_size=64,
+        # Batch 64 at 224px peaks at ~0.8GB (n) ... ~5.4GB (x) reserved, so every size fits in one pass.
+        yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 64},
     ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 Ti 16GB (Blackwell, sm_120)
     # 16GB leaves room for the paper's batch of 4 x 2 on Qwen3-VL-8B QLoRA (NF4 weights ~7GB incl. the
@@ -119,6 +146,10 @@ HARDWARE_PROFILES = {
         quantize_vision=False,
         max_bf16_params_b=4.5,
         yolo_batch_size=128,
+        # Batch 128 at 224px peaks at ~1.5GB (n) ... ~10GB (x) reserved (extrapolated from the 3050 Ti
+        # measurements, activations scale linearly with batch), so every size fits in one pass. If x runs
+        # out of memory, use 64 (accumulation 2 keeps the effective batch at 128).
+        yolo26_micro_batch={"n": 128, "s": 128, "m": 128, "l": 128, "x": 128},
     ),
 }
 
@@ -298,13 +329,28 @@ class YOLOConfig:
 
 
 @dataclass
+class YOLO26Config(YOLOConfig):
+    """YOLO26 classification backbone (yolo26{n,s,m,l,x}-cls.pt), same closed-vocabulary word recognizer as
+    YOLOConfig. Used when MODEL_CHOICE = "yolo26". The batch comes from the hardware profile
+    (yolo_batch_size split by yolo26_micro_batch + gradient accumulation).
+    The dataset crops are square (~128x128), so the square 224px input keeps their aspect ratio."""
+    # Peak learning rate by model size: AdamW on pretrained weights, lower for the deeper/wider l and x
+    # (heuristic, not tuned on this dataset).
+    learning_rate_by_size: Dict[str, float] = field(default_factory=lambda: {
+        "n": 1e-3, "s": 1e-3, "m": 1e-3, "l": 5e-4, "x": 5e-4,
+    })
+
+
+@dataclass
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
-    model_type: Literal["qwen-vl", "crnn", "yolo"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26"] = "qwen-vl"
     qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
     # Must be an ultralytics *classification* checkpoint (name ends with "-cls"), e.g.
     # yolov8n-cls.pt / yolov8s-cls.pt / yolov8m-cls.pt / yolov8l-cls.pt / yolov8x-cls.pt.
     yolo_checkpoint: str = "yolov8m-cls.pt"
+    # YOLO26 classification checkpoint: yolo26n-cls.pt | yolo26s-cls.pt | yolo26m-cls.pt | yolo26l-cls.pt | yolo26x-cls.pt
+    yolo26_checkpoint: str = "yolo26m-cls.pt"
     max_pixels: int = 512 * 512
     min_pixels: int = 256 * 256
     max_seq_length: int = 512
@@ -316,7 +362,7 @@ class PipelineConfig:
     """Master pipeline configuration."""
     stage: Literal["augment", "train", "infer"] = "train"
     hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
-    model_type: Literal["qwen-vl", "crnn", "yolo"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26"] = "qwen-vl"
     device: str = "cuda"
     mixed_precision: str = "fp16"
 
@@ -328,6 +374,7 @@ class PipelineConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     crnn: CRNNConfig = field(default_factory=CRNNConfig)
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
+    yolo26: YOLO26Config = field(default_factory=YOLO26Config)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     output_dir: str = OUTPUT_ROOT.as_posix()
@@ -354,17 +401,32 @@ class PipelineConfig:
         self.apply_hardware_profile()
         if self.model_type == "crnn":
             self.apply_crnn_recipe()
-        elif self.model_type == "yolo":
+        elif self.is_yolo:
             self.apply_yolo_recipe()
         self.resolve_run_paths()
 
     @property
+    def is_yolo(self) -> bool:
+        """True for the YOLO word classifiers ("yolo" = YOLOv8 etc., "yolo26" = YOLO26)."""
+        return self.model_type in ("yolo", "yolo26")
+
+    @property
+    def yolo_checkpoint(self) -> str:
+        """Classification checkpoint of the selected YOLO family."""
+        return self.model.yolo26_checkpoint if self.model_type == "yolo26" else self.model.yolo_checkpoint
+
+    @property
+    def yolo_settings(self) -> YOLOConfig:
+        """Recipe settings (image size, lr, label smoothing, early stopping) of the selected YOLO family."""
+        return self.yolo26 if self.model_type == "yolo26" else self.yolo
+
+    @property
     def model_name(self) -> str:
-        """Folder name for the model, e.g. "Qwen3-VL-8B-Instruct", "CRNN" or "yolov8n"."""
+        """Folder name for the model, e.g. "Qwen3-VL-8B-Instruct", "CRNN", "yolov8n" or "yolo26m-cls"."""
         if self.model_type == "crnn":
             return "CRNN"
-        if self.model_type == "yolo":
-            name = Path(self.model.yolo_checkpoint).name
+        if self.is_yolo:
+            name = Path(self.yolo_checkpoint).name
             return name[:-3] if name.endswith(".pt") else name
         return self.model.qwen_checkpoint.rstrip("/").split("/")[-1]
 
@@ -434,18 +496,28 @@ class PipelineConfig:
 
     def apply_yolo_recipe(self) -> None:
         """YOLO classifier fine-tunes pretrained weights with AdamW + cosine decay. Batch size comes from
-        the hardware profile; precision (bf16/fp16 autocast) stays as the profile set it."""
-        c = self.yolo
+        the hardware profile; precision (bf16/fp16 autocast) stays as the profile set it.
+        YOLO26 splits the profile's effective batch into the largest micro-batch that fits for the chosen
+        model size plus gradient accumulation (e.g. 16 x 2 = 32 for yolo26x on the 4GB laptop)."""
+        hw = HARDWARE_PROFILES[self.hardware_profile]
+        c = self.yolo_settings
+        batch_size, accum, learning_rate = hw.yolo_batch_size, 1, c.learning_rate
+        if self.model_type == "yolo26":
+            size = yolo26_size(self.model.yolo26_checkpoint)
+            batch_size = min(hw.yolo26_micro_batch.get(size, hw.yolo_batch_size), hw.yolo_batch_size)
+            accum = -(-hw.yolo_batch_size // batch_size)  # ceil
+            learning_rate = c.learning_rate_by_size.get(size, c.learning_rate)
         self._apply_small_model_recipe(
-            batch_size=HARDWARE_PROFILES[self.hardware_profile].yolo_batch_size,
-            learning_rate=c.learning_rate, num_epochs=c.num_epochs, weight_decay=c.weight_decay,
-            warmup_steps=c.warmup_steps, scheduler="cosine", fp32=False)
+            batch_size=batch_size, learning_rate=learning_rate, num_epochs=c.num_epochs,
+            weight_decay=c.weight_decay, warmup_steps=c.warmup_steps, scheduler="cosine", fp32=False,
+            gradient_accumulation_steps=accum)
 
     def _apply_small_model_recipe(self, *, batch_size: int, learning_rate: float, num_epochs: int,
                                   weight_decay: float, warmup_steps: int, scheduler: str,
-                                  fp32: bool) -> None:
+                                  fp32: bool, gradient_accumulation_steps: int = 1) -> None:
         """Replace the Qwen/LoRA settings the hardware profile applied with those of a small image model
-        (CRNN, YOLO classifier): no quantization, no gradient accumulation, per-epoch evaluation."""
+        (CRNN, YOLO classifier): no quantization, per-epoch evaluation, and no gradient accumulation
+        unless the model needs it to reach its batch size."""
         t = self.training
         self.quantization.load_in_4bit = False
         if fp32:
@@ -455,7 +527,7 @@ class PipelineConfig:
 
         t.per_device_train_batch_size = batch_size
         t.per_device_eval_batch_size = batch_size
-        t.gradient_accumulation_steps = 1
+        t.gradient_accumulation_steps = gradient_accumulation_steps
         t.num_epochs = num_epochs
         t.learning_rate = learning_rate
         t.warmup_steps = warmup_steps

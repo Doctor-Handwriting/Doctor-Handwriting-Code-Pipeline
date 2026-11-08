@@ -1,6 +1,6 @@
 # Vision-Language Model Training Pipeline
 
-Production-ready multimodal VLM training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** using Qwen-VL and lightweight YOLO models.
+Production-ready handwriting-recognition training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** and larger RTX 5070/5070 Ti systems. It supports Qwen-VL, the paper-based CRNN, and YOLO/YOLO26 classification models.
 
 ## Features
 
@@ -20,12 +20,12 @@ vlm_pipeline/
 │   └── config.py          # Dataclass configs (hardware, LoRA, training, paths)
 ├── models/
 │   ├── __init__.py
-│   └── models.py          # Qwen-VL & YOLO loaders with 4-bit quantization
+│   └── models.py          # Qwen-VL, CRNN, and YOLO/YOLO26 model loaders
 ├── utils/
 │   ├── __init__.py
 │   ├── dataset_parser.py  # DHP + RxHand parsing to instruction format
 │   ├── augmentor.py       # Medical handwriting augmentations
-│   ├── metrics.py         # WER, CER, accuracy, mAP computation
+│   ├── metrics.py         # WER, CER, and accuracy computation
 │   └── visualization.py   # Loss/accuracy/CER/WER/LR training plots
 ├── Augmented_Dataset/     # AUGMENTATION_MODE = "offline" only (created by STAGE = "augment", git-ignored)
 │   ├── DHP/    {original/, augmented/, augmentation_manifest.json}
@@ -52,12 +52,14 @@ vlm_pipeline/
 ```bash
 # Create virtual environment (recommended)
 python -m venv venv
-source venv/Scripts/activate  # Windows
+# Windows PowerShell:
+.\venv\Scripts\Activate.ps1
 # or
-source venv/bin/activate      # Linux/Mac
+source venv/bin/activate      # Linux/macOS
 
-# For CUDA support, install torch matching your GPU driver first, e.g.
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CUDA support, install torch matching your GPU driver first.
+# RTX 5070/5070 Ti require the cu128 build and an NVIDIA driver >= 570:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # Install dependencies
 pip install -r requirements.txt
@@ -98,7 +100,13 @@ The pipeline automatically:
 - Parses RxHand (Handwritten Prescription) dataset splits
 - Filters corrupted `.trashed-*` files
 - Creates multimodal instruction JSON format
-- Splits into 85% train / 15% validation
+- Splits into 80% train / 20% validation by default (seed 42)
+
+Select the data setup at the top of `main.py`:
+
+- `DATASET_MODE = "combined"` merges DHP and RxHand before one split.
+- `DATASET_MODE = "dhp"` or `"rxhand"` trains on one dataset only.
+- With `DATASET_MODE = "rxhand"`, `RXHAND_OFFICIAL_SPLIT = True` uses RxHand's `Train_Set` and `Test_Set` instead of re-splitting.
 
 ### 2. Run Pipeline
 
@@ -173,7 +181,22 @@ python main.py
 
 Edit `configs/config.py` to customize:
 
-### Hardware (Fixed for 4GB VRAM)
+### Hardware Profiles
+
+Set `HARDWARE_PROFILE` in `main.py` to `auto`, `laptop_3050ti`, `pc_5070`, or `pc_5070ti`.
+The selected profile supplies batch size, accumulation, workers, image resolution, and precision:
+
+| Profile | Precision | Train batch x accumulation | Max image pixels |
+|---|---|---:|---:|
+| `laptop_3050ti` | 4-bit NF4 + fp16 | 1 x 8 | 512 x 512 |
+| `pc_5070` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 2 x 4 | 768 x 768 |
+| `pc_5070ti` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 4 x 2 | 768 x 768 |
+
+Qwen checkpoints that fit the profile's bf16 parameter limit skip 4-bit quantization. The `crnn` recipe
+always uses fp32 and batch 10; YOLO/YOLO26 batch sizes come from the selected profile. If the 8B Qwen model
+causes CUDA OOM, reduce the profile batch to 1 x 8 in `configs/config.py` or use a smaller checkpoint.
+
+The laptop-specific defaults are:
 ```python
 per_device_train_batch_size = 1           # Don't increase!
 gradient_accumulation_steps = 8           # Effective batch = 8
@@ -190,19 +213,23 @@ bnb_4bit_use_double_quant = True
 
 ### LoRA Adaptation
 ```python
-r = 8, lora_alpha = 16, lora_dropout = 0.05
+r = 32, lora_alpha = 64, lora_dropout = 0.05
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", 
                   "gate_proj", "up_proj", "down_proj"]
 ```
 
 ### Augmentation
 ```python
-enable_augmentation = True
+enable_augmentation = True  # used by online augmentation
 motion_blur_prob = 0.3
 elastic_deform_prob = 0.3
 perspective_prob = 0.2
 brightness_contrast_prob = 0.5
 ```
+
+`AUGMENTATION_MODE = "offline"` is a separate workflow: run `STAGE = "augment"` first to create
+`Augmented_Dataset/`, then run `train` or `infer`. Offline runs include `_offline` in their run name and
+use fixed, reproducible variants; validation images are never augmented.
 
 ## Dataset Format
 
@@ -280,7 +307,10 @@ on the validation set and writes `inference_results.json` (per sample) and
 - **CER** (Character Error Rate): Lower is better
 - **char_accuracy**: 1 − CER — higher is better
 - **accuracy**: Exact match %; **accuracy_normalized**: case/whitespace-insensitive match %
-- **mAP** (for YOLO): Mean Average Precision @IoU=0.5
+- **YOLO/YOLO26 accuracy**: these models are closed-vocabulary classifiers. Each distinct training label is
+  a class, so a word absent from the training vocabulary can never be predicted. Use Qwen-VL or CRNN for
+  free-form transcription. YOLO detection checkpoints such as `yolov8n.pt` are not supported; use a
+  `-cls` checkpoint.
 
 WER/CER/accuracy require `model.generate`, which is slow, so during training they are computed on
 `cfg.evaluation.train_eval_samples` (default 50) val samples. On a bigger GPU set it higher or to

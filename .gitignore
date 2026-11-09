@@ -20,13 +20,17 @@ __pycache__/
 .env.*
 !.env.example
 
-# Generated pipeline outputs
-runs/
+# Generated pipeline outputs - keep results but ignore model files
+runs/**/checkpoints/
+runs/**/logs/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.bin
+# Explicitly track CSV and JSON results
+!*.csv
+!*.json
 # YOLO / export artifacts
 *.onnx
 *.engine

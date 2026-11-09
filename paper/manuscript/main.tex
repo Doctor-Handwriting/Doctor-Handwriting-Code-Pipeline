@@ -1,0 +1,90 @@
+\documentclass[conference,a4paper]{IEEEtran}
+\IEEEoverridecommandlockouts % needed only for \thanks (funding footnote); remove if unused
+
+% --- Citations -------------------------------------------------------------
+% nocompress: multiple citations print as [6, 7, 8, 9] instead of the range [6]--[9].
+% Remove the option if a reviewer asks for ranges.
+\usepackage[nocompress]{cite}
+\renewcommand{\citepunct}{,\penalty\citepunctpenalty\ }
+
+% --- Math, graphics, tables ------------------------------------------------
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{array}
+\usepackage{xcolor}
+\graphicspath{{figures/}}
+
+% --- hyperref: keep LAST. Clickable citations/cross-refs, no boxes or colors.
+\usepackage[hidelinks]{hyperref}
+
+% Forces a new row of author blocks (use instead of \and). IEEEtran wraps rows
+% automatically by width; the long e-mails would otherwise give a 2 + 3 layout.
+\makeatletter
+\newcommand{\newlineauthors}{%
+  \end{@IEEEauthorhalign}\hfill\mbox{}\par
+  \mbox{}\hfill\begin{@IEEEauthorhalign}
+}
+\makeatother
+
+\begin{document}
+
+\title{Vision Language Model Comparison for Doctor Medical Recognition
+% TODO: funding footnote, e.g. \thanks{...}; delete if none.
+}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Syahdan Rizqi Ruhendy}
+\IEEEauthorblockA{\textit{School of Computing} \\
+\textit{Telkom University}\\
+Bandung, Indonesia \\
+{\footnotesize syahdanruhendy@student.telkomuniversity.ac.id}}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Muhammad Ghozy Abdurrahman}
+\IEEEauthorblockA{\textit{School of Computing} \\
+\textit{Telkom University}\\
+Bandung, Indonesia \\
+{\footnotesize mghozyabdurrahman@student.telkomuniversity.ac.id}}
+\and
+\IEEEauthorblockN{3\textsuperscript{rd} Muhammad Syafiq Aqilla}
+\IEEEauthorblockA{\textit{School of Computing} \\
+\textit{Telkom University}\\
+Bandung, Indonesia \\
+{\footnotesize syafiqaqla@student.telkomuniversity.ac.id}}
+\newlineauthors % row 1: authors 1-3, row 2: authors 4-5
+\IEEEauthorblockN{4\textsuperscript{th} Joshua Pinem}
+\IEEEauthorblockA{\textit{School of Computing} \\
+\textit{Telkom University}\\
+Bandung, Indonesia \\
+{\footnotesize joshuapinem@student.telkomuniversity.ac.id}}
+\and
+\IEEEauthorblockN{5\textsuperscript{th} Widi Astuti}
+\IEEEauthorblockA{\textit{School of Computing} \\
+\textit{Telkom University}\\
+Bandung, Indonesia \\
+{\footnotesize widiwdu@telkomuniversity.ac.id}}
+}
+
+\maketitle
+
+\begin{abstract}
+TODO: Abstract.
+\end{abstract}
+
+\begin{IEEEkeywords}
+TODO: keywords.
+\end{IEEEkeywords}
+
+% Uncomment a section once it has content, so the PDF has no empty headings.
+\input{sections/01-introduction}
+\input{sections/02-related-work}
+\input{sections/03-methodology}
+% \input{sections/04-results}
+% \input{sections/05-conclusion}
+
+% TODO: acknowledgment (unnumbered in IEEE), uncomment when written:
+% \section*{Acknowledgment}
+
+\bibliographystyle{IEEEtran}
+\bibliography{References}
+
+\end{document}

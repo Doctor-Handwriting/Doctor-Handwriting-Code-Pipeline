@@ -44,7 +44,20 @@ hf_cache/
 .claude/settings.local.json
 
 # Local editor and OS files
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .idea/
 .DS_Store
 Thumbs.db
+# LaTeX build auxiliaries (paper/manuscript/main.pdf IS committed)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.synctex.gz

@@ -1,0 +1,10 @@
+# latexmkrc — build settings for main.tex (run from this folder)
+#   latexmk        build main.pdf once
+#   latexmk -pvc   watch .tex/.bib files and rebuild on every save (stop with Ctrl+C)
+#   latexmk -c     remove auxiliary build files (keeps main.pdf)
+@default_files = ('main.tex');
+$pdf_mode = 1;
+$pdflatex = 'pdflatex -interaction=nonstopmode -file-line-error -synctex=1 %O %S';
+$bibtex_use = 2;
+$view = 'none';
+$sleep_time = 1;

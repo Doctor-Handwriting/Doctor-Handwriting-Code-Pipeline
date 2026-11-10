@@ -1,0 +1,141 @@
+{
+  "model_name": "CRNN",
+  "stage": "train",
+  "hardware_profile": "pc_5070",
+  "model_type": "crnn",
+  "device": "cuda",
+  "mixed_precision": "fp32",
+  "quantization": {
+    "load_in_4bit": false,
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_compute_dtype": "torch.float32",
+    "bnb_4bit_use_double_quant": true,
+    "upcast_fp32": false,
+    "quantize_vision": false
+  },
+  "lora": {
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "bias": "none",
+    "task_type": "CAUSAL_LM",
+    "target_modules": [
+      "q_proj",
+      "v_proj",
+      "o_proj"
+    ]
+  },
+  "training": {
+    "per_device_train_batch_size": 10,
+    "per_device_eval_batch_size": 10,
+    "gradient_accumulation_steps": 1,
+    "num_epochs": 300,
+    "learning_rate": 0.0005,
+    "warmup_steps": 0,
+    "weight_decay": 0.0,
+    "optim": "adamw_torch",
+    "lr_scheduler_type": "constant",
+    "lr_scheduler_num_cycles": 2,
+    "load_best_model_at_end": true,
+    "save_total_limit": 3,
+    "max_grad_norm": 1.0,
+    "num_workers": 4,
+    "pin_memory": true,
+    "use_bf16": false,
+    "use_fp16": false,
+    "gradient_checkpointing": false,
+    "seed": 3407
+  },
+  "dataset": {
+    "dataset_root": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset",
+    "dhp_root": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/DHP",
+    "dhp_labels": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/DHP/doctor_handwriting_labels.csv",
+    "dhp_images": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/DHP/img/img",
+    "rxhand_root": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/RxHand",
+    "rxhand_train_labels": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/RxHand/Train_Label.csv",
+    "rxhand_test_labels": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/RxHand/Test_Labels.csv",
+    "rxhand_train_images": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/RxHand/Train_Set",
+    "rxhand_test_images": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Dataset/RxHand/Test_Set",
+    "mode": "dhp",
+    "rxhand_official_split": false,
+    "train_split": 0.8,
+    "val_split": 0.2,
+    "max_samples": null
+  },
+  "augmentation": {
+    "mode": "offline",
+    "offline_root": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/Augmented_Dataset",
+    "offline_include_mixed": true,
+    "offline_seed": 42,
+    "enable_augmentation": true,
+    "motion_blur_prob": 0.3,
+    "elastic_deform_prob": 0.3,
+    "perspective_prob": 0.2,
+    "brightness_contrast_prob": 0.5,
+    "rotation_limit": 15,
+    "shift_limit": 0.1,
+    "scale_limit": 0.2
+  },
+  "model": {
+    "model_type": "crnn",
+    "qwen_checkpoint": "Qwen/Qwen3-VL-8B-Instruct",
+    "yolo_checkpoint": "yolov8m-cls.pt",
+    "yolo26_checkpoint": "yolo26m-cls.pt",
+    "max_pixels": 589824,
+    "min_pixels": 65536,
+    "max_seq_length": 512,
+    "gradient_checkpointing": false
+  },
+  "crnn": {
+    "img_height": 64,
+    "img_width": 340,
+    "lstm_hidden": 256,
+    "lstm_layers": 3,
+    "batch_norm": true,
+    "learning_rate": 0.0005,
+    "batch_size": 10,
+    "num_epochs": 300,
+    "early_stopping_patience": 20
+  },
+  "yolo": {
+    "imgsz": 224,
+    "learning_rate": 0.001,
+    "weight_decay": 0.01,
+    "num_epochs": 50,
+    "warmup_steps": 100,
+    "label_smoothing": 0.1,
+    "early_stopping_patience": 10
+  },
+  "yolo26": {
+    "imgsz": 224,
+    "learning_rate": 0.001,
+    "weight_decay": 0.01,
+    "num_epochs": 50,
+    "warmup_steps": 100,
+    "label_smoothing": 0.1,
+    "early_stopping_patience": 10,
+    "learning_rate_by_size": {
+      "n": 0.001,
+      "s": 0.001,
+      "m": 0.001,
+      "l": 0.0005,
+      "x": 0.0005
+    }
+  },
+  "evaluation": {
+    "train_eval_samples": null,
+    "infer_samples": null,
+    "max_new_tokens": 64,
+    "adapter_path": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs/CRNN/run_20261110-200934_pc_5070_dhp_offline/checkpoints/final"
+  },
+  "output_dir": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs",
+  "run_name": "run_20261110-200934_pc_5070_dhp_offline",
+  "run_dir": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs/CRNN/run_20261110-200934_pc_5070_dhp_offline",
+  "checkpoint_dir": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs/CRNN/run_20261110-200934_pc_5070_dhp_offline/checkpoints",
+  "log_dir": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs/CRNN/run_20261110-200934_pc_5070_dhp_offline/logs",
+  "plots_dir": "D:/Goji/Doctor_VLM/Doctor-Handwriting-Code-Pipeline/runs/CRNN/run_20261110-200934_pc_5070_dhp_offline/plots",
+  "save_steps": 100,
+  "eval_steps": 100,
+  "log_steps": 10,
+  "eval_by_epoch": true
+}

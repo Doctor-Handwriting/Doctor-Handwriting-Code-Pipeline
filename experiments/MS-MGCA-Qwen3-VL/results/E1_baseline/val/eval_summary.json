@@ -1,0 +1,16 @@
+{
+  "num_samples": 50,
+  "cer": 0.47093023255813954,
+  "wer": 0.8245614035087719,
+  "exact_match": 0.16,
+  "normalized_match": 0.22,
+  "character_accuracy": 0.5290697674418605,
+  "num_correct_exact": 8,
+  "num_correct_normalized": 11,
+  "latency_per_sample_ms": 279.62,
+  "throughput_samples_per_sec": 3.58,
+  "peak_gpu_memory_mb": 1556.19,
+  "total_eval_time_sec": 13.98,
+  "trainable_parameters": 315592704,
+  "total_parameters": 1221562368
+}

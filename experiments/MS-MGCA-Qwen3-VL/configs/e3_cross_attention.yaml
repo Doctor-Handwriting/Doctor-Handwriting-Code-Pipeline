@@ -1,0 +1,71 @@
+model:
+  checkpoint: Qwen/Qwen3-VL-2B-Instruct
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  quantize_vision: false
+  max_pixels: 262144
+  min_pixels: 16384
+  device_map: cuda:0
+lora:
+  enabled: true
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules:
+  - q_proj
+  - v_proj
+  - o_proj
+  - k_proj
+  bias: none
+multiscale:
+  enabled: false
+  crop_size: 224
+  grid_size: 2
+  overlap_ratio: 0.15
+  reduction_method: spatial_pool
+  fusion_method: gated
+  hidden_dim: null
+cross_attention:
+  enabled: true
+  num_queries: 4
+  num_heads: 8
+  dropout: 0.1
+  integration_mode: adapter
+uncertainty:
+  enabled: false
+  head_type: mlp
+  pooling_method: mean
+  confidence_threshold: 0.7
+  loss_weight: 0.5
+dataset:
+  dataset_root: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\Dataset\RxHand
+  train_labels: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\Dataset\RxHand\Train_Label.csv
+  test_labels: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\Dataset\RxHand\Test_Labels.csv
+  train_images: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\Dataset\RxHand\Train_Set
+  test_images: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\Dataset\RxHand\Test_Set
+  train_split: 0.8
+  val_split: 0.2
+  seed: 3407
+  max_train_samples: null
+  max_val_samples: null
+  max_test_samples: null
+training:
+  output_dir: D:\Goji\Doctor_VLM\Doctor-Handwriting-Code-Pipeline\runs\MS-MGCA-Qwen3-VL
+  run_name: E3_cross_attention
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_epochs: 10
+  learning_rate: 0.0002
+  adapter_learning_rate: 0.0005
+  confidence_learning_rate: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  gradient_checkpointing: true
+  mixed_precision: bf16
+  seed: 3407
+  save_steps: 200
+  eval_steps: 100
+  logging_steps: 10

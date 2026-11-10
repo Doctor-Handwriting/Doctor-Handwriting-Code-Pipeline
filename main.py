@@ -55,7 +55,7 @@ STAGE = "train"  # Options: "augment", "train", "infer"
 #                sizes n/s/m/l/x); per-size batch/accumulation for each hardware profile and per-size
 #                learning rate: YOLO26Config + HardwareProfile.yolo26_micro_batch. Same closed-vocabulary
 #                ceiling as "yolo".
-MODEL_CHOICE = "qwen-vl"
+MODEL_CHOICE = "crnn"  # Options: "qwen-vl", "crnn", "yolo", "yolo26"
 # Used when MODEL_CHOICE == "qwen-vl". Any Qwen2.5-VL / Qwen3-VL checkpoint, e.g.
 #   "Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"
 # (8B needs a 12GB+ profile and trains as 4-bit QLoRA; 2B/4B train in plain bf16 on pc_5070ti;
@@ -73,7 +73,7 @@ YOLO26_CHECKPOINT = "yolo26m-cls.pt"
 #          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
 #          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
-HARDWARE_PROFILE = "pc_5070ti"
+HARDWARE_PROFILE = "pc_5070"
 # Which data to train and validate on:
 #   "combined" -> DHP + RxHand merged into one pool, then a single train/val split (default)
 #   "dhp"      -> DHP only, split into its own train/val
@@ -81,7 +81,7 @@ HARDWARE_PROFILE = "pc_5070ti"
 # For "rxhand", RXHAND_OFFICIAL_SPLIT = True trains on RxHand's Train_Set and validates on its Test_Set
 # instead of re-splitting them together. Non-combined runs get the mode in their run folder name
 # (run_<timestamp>_<profile>_dhp), so separate experiments never overwrite each other.
-DATASET_MODE = "combined"
+DATASET_MODE = "dhp"  # Options: "combined", "dhp", "rxhand"
 RXHAND_OFFICIAL_SPLIT = False
 # How training images are augmented:
 #   "online"  -> random transforms applied to each training image on the fly (nothing stored on disk, a new
@@ -93,7 +93,7 @@ RXHAND_OFFICIAL_SPLIT = False
 #                images get variants (the split is made on the originals), validation uses originals.
 #                Training epochs get ~8x larger, so lower num_epochs accordingly. Offline runs get "_offline"
 #                in their run folder name.
-AUGMENTATION_MODE = "online"
+AUGMENTATION_MODE = "offline"
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:

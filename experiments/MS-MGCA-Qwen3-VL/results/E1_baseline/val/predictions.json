@@ -1,0 +1,402 @@
+[
+  {
+    "image_id": "P1613.jpg",
+    "prediction": "CIPROFLOXACIN",
+    "reference": "Cap. ESONEX",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P2276.jpg",
+    "prediction": "flexer",
+    "reference": "Fenix-V",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.8571428571428571
+  },
+  {
+    "image_id": "P4219.jpg",
+    "prediction": "Cap.",
+    "reference": "Capsule",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5714285714285714
+  },
+  {
+    "image_id": "P1731.jpg",
+    "prediction": "Endurix",
+    "reference": "Endurex",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.14285714285714285
+  },
+  {
+    "image_id": "P3486.jpg",
+    "prediction": "Edecols",
+    "reference": "Edeloss",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.2857142857142857
+  },
+  {
+    "image_id": "P4336.jpg",
+    "prediction": "Anpulin-12",
+    "reference": "Insulin R",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5555555555555556
+  },
+  {
+    "image_id": "P4444.jpg",
+    "prediction": "B13101",
+    "reference": "Bislol",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.8333333333333334
+  },
+  {
+    "image_id": "P3510.jpg",
+    "prediction": "Napa",
+    "reference": "Napa",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P5283.jpg",
+    "prediction": "Flemox",
+    "reference": "flemex",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.3333333333333333
+  },
+  {
+    "image_id": "P5260.jpg",
+    "prediction": "lansomax",
+    "reference": "lansomax",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P4109.jpg",
+    "prediction": "Tab.",
+    "reference": "Tablet",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P3199.jpg",
+    "prediction": "Fexofenadine",
+    "reference": "Fexofenadine",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P2976.jpg",
+    "prediction": "2100",
+    "reference": "Zimax",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P4154.jpg",
+    "prediction": "c. 4.",
+    "reference": "Capsule",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P4692.jpg",
+    "prediction": "zimax",
+    "reference": "zimax",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P4500.jpg",
+    "prediction": "Gapa P",
+    "reference": "gaba p",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P1141.jpg",
+    "prediction": "Deixil",
+    "reference": "Deixil",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P5077.jpg",
+    "prediction": "Napa one",
+    "reference": "napa one",
+    "exact_match": false,
+    "normalized_match": true,
+    "cer": 0.125
+  },
+  {
+    "image_id": "P2301.jpg",
+    "prediction": "20201",
+    "reference": "Lerozol",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P3953.jpg",
+    "prediction": "Cap.",
+    "reference": "Capsule",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5714285714285714
+  },
+  {
+    "image_id": "P2808.jpg",
+    "prediction": "Funclav",
+    "reference": "Furoclav",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.25
+  },
+  {
+    "image_id": "P3069.jpg",
+    "prediction": "Neuro-3",
+    "reference": "Neuro-B",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.14285714285714285
+  },
+  {
+    "image_id": "P4302.jpg",
+    "prediction": "tab",
+    "reference": "Tablet",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.6666666666666666
+  },
+  {
+    "image_id": "P4233.jpg",
+    "prediction": "Dilatrate",
+    "reference": "Diet",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.5
+  },
+  {
+    "image_id": "P3982.jpg",
+    "prediction": "2wj",
+    "reference": "Injection",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.8888888888888888
+  },
+  {
+    "image_id": "P2992.jpg",
+    "prediction": "fenix-v",
+    "reference": "Fenix-V",
+    "exact_match": false,
+    "normalized_match": true,
+    "cer": 0.2857142857142857
+  },
+  {
+    "image_id": "P5176.jpg",
+    "prediction": "Heparin",
+    "reference": "fexocon",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.7142857142857143
+  },
+  {
+    "image_id": "P4556.jpg",
+    "prediction": "NaCl",
+    "reference": "nacl",
+    "exact_match": false,
+    "normalized_match": true,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P1726.jpg",
+    "prediction": "\u041f\u043e\u0432\u0438",
+    "reference": "Rosu",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P3994.jpg",
+    "prediction": "Syp",
+    "reference": "Syrup",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.4
+  },
+  {
+    "image_id": "P3132.jpg",
+    "prediction": "Traxyl",
+    "reference": "Traxyl",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P4321.jpg",
+    "prediction": "Tab.",
+    "reference": "Tablet",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P1512.jpg",
+    "prediction": "M-1000",
+    "reference": "m-lucas 10",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.8
+  },
+  {
+    "image_id": "P2457.jpg",
+    "prediction": "Alcohol",
+    "reference": "Alanol",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P5096.jpg",
+    "prediction": "ointment",
+    "reference": "ointment",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P1982.jpg",
+    "prediction": "\u041f\u0430\u0444\u0435\u0442\u0438\u043d",
+    "reference": "Rasiflep",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 1.0
+  },
+  {
+    "image_id": "P2410.jpg",
+    "prediction": "Nexa",
+    "reference": "Nexe",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.25
+  },
+  {
+    "image_id": "P3021.jpg",
+    "prediction": "Naprosyn Plus",
+    "reference": "Naprosin Plus",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.07692307692307693
+  },
+  {
+    "image_id": "P2172.jpg",
+    "prediction": "Rigitin",
+    "reference": "Tiginor",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5714285714285714
+  },
+  {
+    "image_id": "P2890.jpg",
+    "prediction": "Neurax",
+    "reference": "Neuro-B",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.42857142857142855
+  },
+  {
+    "image_id": "P5020.jpg",
+    "prediction": "Metaamol",
+    "reference": "metaconil",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5555555555555556
+  },
+  {
+    "image_id": "P2075.jpg",
+    "prediction": "Gantrix",
+    "reference": "Gavitfep",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.625
+  },
+  {
+    "image_id": "P2858.jpg",
+    "prediction": "Dendron",
+    "reference": "Derolon",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.42857142857142855
+  },
+  {
+    "image_id": "P3932.jpg",
+    "prediction": "Tonex",
+    "reference": "Torex",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.2
+  },
+  {
+    "image_id": "P1490.jpg",
+    "prediction": "Carbon D",
+    "reference": "Calboral D",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.4
+  },
+  {
+    "image_id": "P4526.jpg",
+    "prediction": "Rolarc",
+    "reference": "rolac",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.4
+  },
+  {
+    "image_id": "P4746.jpg",
+    "prediction": "Napra",
+    "reference": "napa",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.5
+  },
+  {
+    "image_id": "P3211.jpg",
+    "prediction": "Montinex",
+    "reference": "Montinex",
+    "exact_match": true,
+    "normalized_match": true,
+    "cer": 0.0
+  },
+  {
+    "image_id": "P2266.jpg",
+    "prediction": "Rabe",
+    "reference": "Rebe",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.25
+  },
+  {
+    "image_id": "P4107.jpg",
+    "prediction": "Captopril",
+    "reference": "Capsule",
+    "exact_match": false,
+    "normalized_match": false,
+    "cer": 0.8571428571428571
+  }
+]

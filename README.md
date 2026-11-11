@@ -1,6 +1,6 @@
 # Vision-Language Model Training Pipeline
 
-Production-ready handwriting-recognition training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** and larger RTX 5070/5070 Ti systems. It supports Qwen-VL, the paper-based CRNN, and YOLO/YOLO26 classification models.
+Production-ready handwriting-recognition training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** and larger RTX 5070/5070 Ti systems. It supports Qwen-VL, the proposed MS-MGCA-Qwen3-VL, the paper-based CRNN, and YOLO/YOLO26 classification models.
 
 ## Features
 
@@ -20,7 +20,11 @@ vlm_pipeline/
 │   └── config.py          # Dataclass configs (hardware, LoRA, training, paths)
 ├── models/
 │   ├── __init__.py
-│   └── models.py          # Qwen-VL, CRNN, and YOLO/YOLO26 model loaders
+│   ├── models.py          # Qwen-VL, CRNN, and YOLO/YOLO26 model loaders
+│   └── ms_mgca.py         # Adapter that plugs experiments/MS-MGCA-Qwen3-VL into the pipeline
+├── experiments/
+│   ├── MS-MGCA-Qwen3-VL/  # Proposed model: code, E1-E6 ablation configs, unit tests (own README)
+│   └── <model_name>/      # Per-model progress notes copied from finished runs (see experiments/README.md)
 ├── utils/
 │   ├── __init__.py
 │   ├── dataset_parser.py  # DHP + RxHand parsing to instruction format
@@ -120,7 +124,9 @@ python main.py
 ```bash
 # Edit main.py:
 STAGE = "train"
-MODEL_CHOICE = "qwen-vl"  # or "crnn", "yolo", "yolo26"
+MODEL_CHOICE = "qwen-vl"  # or "ms-mgca", "crnn", "yolo", "yolo26"
+QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"  # backbone for "qwen-vl" and "ms-mgca" (Qwen3-VL only)
+MSMGCA_EXPERIMENT = "e6_full_model"   # used when MODEL_CHOICE = "ms-mgca": e1_baseline ... e6_full_model
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOICE = "yolo26"
 HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_5070", "auto"
 DATASET_MODE = "combined"  # or "dhp" / "rxhand" to train and validate on one dataset only
@@ -176,6 +182,50 @@ all three profiles at the same effective batch (32 laptop / 64 `pc_5070` / 128 `
 STAGE = "infer"
 python main.py
 ```
+
+## MS-MGCA-Qwen3-VL (`MODEL_CHOICE = "ms-mgca"`)
+
+Multi-Scale and Uncertainty-Aware Qwen3-VL with Medication-Guided Cross-Attention
+(`experiments/MS-MGCA-Qwen3-VL/`, see its README for the architecture). It runs through the same
+`main.py` stages, datasets (`DATASET_MODE`, `AUGMENTATION_MODE`), metrics, plots and `runs/` layout as the
+other models, so its validation scores are directly comparable.
+
+Pick the ablation with `MSMGCA_EXPERIMENT` and the backbone with `QWEN_CHECKPOINT`:
+
+| `MSMGCA_EXPERIMENT` | Multi-scale fusion (A) | Medication cross-attention (B) | Confidence head (D) |
+|---|:---:|:---:|:---:|
+| `e1_baseline` | | | |
+| `e2_multiscale` | yes | | |
+| `e3_cross_attention` | | yes | |
+| `e4_confidence` | | | yes |
+| `e5_multiscale_crossattn` | yes | yes | |
+| `e6_full_model` (default) | yes | yes | yes |
+
+```python
+MODEL_CHOICE = "ms-mgca"
+QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"   # any Qwen3-VL checkpoint; 2B trains in plain bf16 on pc_5070
+MSMGCA_EXPERIMENT = "e6_full_model"
+STAGE = "train"   # then "infer"
+```
+
+- **Training** fine-tunes LoRA and all enabled MS-MGCA components jointly. Each component has its own learning
+  rate from the experiment config (LoRA 2e-4, adapters 5e-4, confidence head 1e-3).
+- **Batch size:** the multi-scale / cross-attention path handles one image at a time, so MS-MGCA always uses
+  micro-batch 1 with gradient accumulation (effective batch 8 on every profile, same as the other models).
+  It needs a GPU with bf16 support.
+- **Outputs:** `runs/MS-MGCA-Qwen3-VL/run_<time>_<profile>_<experiment>_<size>[_dataset][_offline]/`, e.g.
+  `run_20261111-101500_pc_5070_e6_full_model_2B_rxhand`. `checkpoints/final/` holds only the LoRA adapter
+  (`lora_adapter/`), the module weights (`ms_mgca_modules.safetensors`) and the experiment config
+  (`ms_mgca_config.yaml`). `STAGE = "infer"` evaluates the latest run of the selected experiment and backbone and
+  rebuilds the architecture from that saved config.
+- **Confidence head (E4, E6):** `inference_results.json` gets `confidence` and `requires_review` per sample
+  (flagged when confidence < the experiment's threshold, default 0.70), and the infer stage writes
+  `inference_confidence_metrics.json` (Brier score, ECE, error-detection AUROC, review rate, risk-coverage curve).
+- **Images:** with multi-scale fusion on, non-square images are padded to a square on white (the RxHand crops are
+  already square, so they are unchanged), because the fusion maps local crops onto a square token grid.
+- The experiment's own scripts (`training/train_stage.py` progressive stages 2-5, `evaluation/evaluate.py`,
+  `inference/predict.py`, `tests/`) still work standalone and use their own RxHand split; use `main.py` for results
+  that must match the other models.
 
 ## Configuration
 
@@ -364,6 +414,7 @@ On RTX 3050 Ti (4GB):
 ## References
 
 - Qwen-VL: https://github.com/QwenLM/Qwen-VL
+- Qwen3-VL: https://github.com/QwenLM/Qwen3-VL
 - PEFT/LoRA: https://github.com/huggingface/peft
 - Bitsandbytes: https://github.com/TimDettmers/bitsandbytes
 - Hugging Face Trainer: https://huggingface.co/docs/transformers/training

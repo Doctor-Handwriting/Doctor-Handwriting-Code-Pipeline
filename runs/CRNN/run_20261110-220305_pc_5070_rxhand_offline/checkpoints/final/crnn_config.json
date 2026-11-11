@@ -1,0 +1,8 @@
+{
+  "charset": " %()-./012345678?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+  "img_height": 64,
+  "img_width": 340,
+  "lstm_hidden": 256,
+  "lstm_layers": 3,
+  "batch_norm": true
+}

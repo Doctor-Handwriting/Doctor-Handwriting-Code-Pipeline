@@ -2,8 +2,10 @@
 CLAUDE.md
 
 # Python environments and caches
-Dataset/
-Augmented_Dataset/
+# Anchored to the repo root: an unanchored "Dataset/" also matches (case-insensitively on Windows/macOS) source
+# folders such as experiments/MS-MGCA-Qwen3-VL/dataset/, which would silently keep that code out of git.
+/Dataset/
+/Augmented_Dataset/
 .venv/
 venv/
 env/

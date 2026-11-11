@@ -9,6 +9,7 @@ experiments/
 ├── Qwen3-VL-4B-Instruct/
 ├── Qwen3-VL-8B-Instruct/
 ├── CRNN/
+├── MS-MGCA-Qwen3-VL/     # also holds the model's source code; runs are named run_<time>_<profile>_<experiment>_<size>...
 └── yolo26m-cls/          # add yolo26n-cls/, yolo26s-cls/, ... if other sizes are trained
     ├── README.md         # progress table: one row per run
     └── run_<YYYYmmdd-HHMMSS>_<profile>/   # copied from runs/<model>/<run>/

@@ -155,9 +155,21 @@ HARDWARE_PROFILES = {
 }
 
 
-def find_latest_run(model_dir: Path) -> Optional[Path]:
-    """Most recently trained run under <output_dir>/<model_name> (one with checkpoints/final)."""
-    finals = [p for p in model_dir.glob("*/checkpoints/final") if p.is_dir()]
+# MS-MGCA-Qwen3-VL ablation configs (experiments/MS-MGCA-Qwen3-VL/configs/<name>.yaml), see MSMGCA_EXPERIMENT in main.py:
+#   e1_baseline            Qwen3-VL + LoRA only (reference)
+#   e2_multiscale          + Component A: multi-scale gated fusion
+#   e3_cross_attention     + Component B: medication-guided cross-attention
+#   e4_confidence          + Component D: uncertainty-aware confidence head
+#   e5_multiscale_crossattn  A + B
+#   e6_full_model          A + B + D (the full proposed model)
+MSMGCA_EXPERIMENTS = ("e1_baseline", "e2_multiscale", "e3_cross_attention", "e4_confidence",
+                      "e5_multiscale_crossattn", "e6_full_model")
+
+
+def find_latest_run(model_dir: Path, tag: str = "") -> Optional[Path]:
+    """Most recently trained run under <output_dir>/<model_name> (one with checkpoints/final).
+    `tag` restricts the search to runs whose folder name contains it (MS-MGCA: experiment + backbone size)."""
+    finals = [p for p in model_dir.glob("*/checkpoints/final") if p.is_dir() and tag in p.parent.parent.name]
     return max(finals, key=lambda p: p.stat().st_mtime).parent.parent if finals else None
 
 
@@ -383,8 +395,11 @@ class YOLO26Config(YOLOConfig):
 @dataclass
 class ModelConfig:
     """Model architecture and checkpoint parameters."""
-    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"] = "qwen-vl"
     qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
+    # MODEL_CHOICE = "ms-mgca": which ablation (E1-E6) to build; one of MSMGCA_EXPERIMENTS. The backbone is
+    # qwen_checkpoint (must be a Qwen3-VL model).
+    ms_mgca_experiment: str = "e6_full_model"
     # Must be an ultralytics *classification* checkpoint (name ends with "-cls"), e.g.
     # yolov8n-cls.pt / yolov8s-cls.pt / yolov8m-cls.pt / yolov8l-cls.pt / yolov8x-cls.pt.
     yolo_checkpoint: str = "yolov8m-cls.pt"
@@ -401,7 +416,7 @@ class PipelineConfig:
     """Master pipeline configuration."""
     stage: Literal["augment", "train", "infer"] = "train"
     hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
-    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26"] = "qwen-vl"
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"] = "qwen-vl"
     device: str = "cuda"
     mixed_precision: str = "fp16"
 
@@ -442,7 +457,21 @@ class PipelineConfig:
             self.apply_crnn_recipe()
         elif self.is_yolo:
             self.apply_yolo_recipe()
+        elif self.is_ms_mgca:
+            self.apply_ms_mgca_recipe()
         self.resolve_run_paths()
+
+    @property
+    def is_ms_mgca(self) -> bool:
+        return self.model_type == "ms-mgca"
+
+    @property
+    def run_tag(self) -> str:
+        """Run-folder fragment that keeps MS-MGCA ablations and backbones apart, e.g. "_e6_full_model_2B"."""
+        if not self.is_ms_mgca:
+            return ""
+        size_b = qwen_params_billions(self.model.qwen_checkpoint)
+        return f"_{self.model.ms_mgca_experiment}_{f'{size_b:g}B' if size_b else 'custom'}"
 
     @property
     def is_yolo(self) -> bool:
@@ -464,6 +493,8 @@ class PipelineConfig:
         """Folder name for the model, e.g. "Qwen3-VL-8B-Instruct", "CRNN", "yolov8n" or "yolo26m-cls"."""
         if self.model_type == "crnn":
             return "CRNN"
+        if self.is_ms_mgca:
+            return "MS-MGCA-Qwen3-VL"
         if self.is_yolo:
             name = Path(self.yolo_checkpoint).name
             return name[:-3] if name.endswith(".pt") else name
@@ -473,9 +504,10 @@ class PipelineConfig:
         """Derive this run's folder and its sub-folders (directories are created by the stages)."""
         model_dir = Path(self.output_dir) / self.model_name
         if not self.run_name:
-            latest = find_latest_run(model_dir) if self.stage == "infer" else None
+            latest = find_latest_run(model_dir, self.run_tag) if self.stage == "infer" else None
             self.run_name = latest.name if latest else (
-                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.dataset.mode_tag}{self.augmentation.mode_tag}")
+                f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.run_tag}"
+                f"{self.dataset.mode_tag}{self.augmentation.mode_tag}")
         run = Path(self.run_dir or model_dir / self.run_name)
         self.run_dir = run.as_posix()
         self.checkpoint_dir = self.checkpoint_dir or (run / "checkpoints").as_posix()
@@ -550,6 +582,31 @@ class PipelineConfig:
             batch_size=batch_size, learning_rate=learning_rate, num_epochs=c.num_epochs,
             weight_decay=c.weight_decay, warmup_steps=c.warmup_steps, scheduler="cosine", fp32=False,
             gradient_accumulation_steps=accum)
+
+    def apply_ms_mgca_recipe(self) -> None:
+        """MS-MGCA-Qwen3-VL (experiments/MS-MGCA-Qwen3-VL) keeps the Qwen LoRA/QLoRA setup of the hardware profile
+        with three differences:
+          - micro-batch 1: its multi-scale / cross-attention path processes one image at a time, so the profile's
+            effective batch (batch x accumulation = 8) is reached through gradient accumulation only;
+          - bf16 compute: its custom modules are bf16 (the 3050 Ti supports bf16 too);
+          - plain AdamW: the optimizer is built with per-component learning rates (see MSMGCATrainer in main.py).
+        Gradient checkpointing is enabled inside the model loader, not by the Trainer."""
+        if self.model.ms_mgca_experiment not in MSMGCA_EXPERIMENTS:
+            raise ValueError(f"Unknown MS-MGCA experiment '{self.model.ms_mgca_experiment}'. "
+                             f"Options: {', '.join(MSMGCA_EXPERIMENTS)}")
+        if "qwen3" not in self.model.qwen_checkpoint.lower():
+            raise ValueError(f"MS-MGCA needs a Qwen3-VL backbone, got '{self.model.qwen_checkpoint}' "
+                             f"(set QWEN_CHECKPOINT in main.py, e.g. Qwen/Qwen3-VL-2B-Instruct).")
+        if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            raise ValueError("MS-MGCA needs a GPU with bf16 support.")
+        t = self.training
+        t.gradient_accumulation_steps *= t.per_device_train_batch_size
+        t.per_device_train_batch_size = 1
+        t.per_device_eval_batch_size = 1
+        t.optim = "adamw_torch"
+        t.use_bf16, t.use_fp16 = True, False
+        self.mixed_precision = "bf16"
+        self.quantization.bnb_4bit_compute_dtype = torch.bfloat16
 
     def _apply_small_model_recipe(self, *, batch_size: int, learning_rate: float, num_epochs: int,
                                   weight_decay: float, warmup_steps: int, scheduler: str,

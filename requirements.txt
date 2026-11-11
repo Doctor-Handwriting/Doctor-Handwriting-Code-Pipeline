@@ -7,12 +7,14 @@
 
 torch>=2.7.0  # first release with Blackwell (RTX 50xx) support
 torchvision>=0.22.0
-transformers>=4.57.0  # Qwen3VLForConditionalGeneration (Qwen3-VL) needs >=4.57
+transformers>=4.57.0  # Qwen3VLForConditionalGeneration (Qwen3-VL) needs >=4.57. MS-MGCA-Qwen3-VL (MODEL_CHOICE = "ms-mgca") also uses
+                      # the `mm_encoder_outputs` forward argument, present in the transformers 5.x release it was developed on (5.18)
 accelerate>=0.30.0
 safetensors>=0.4.0  # CRNN weights (models/models.py save_crnn/load_crnn)
 peft>=0.10.0
 bitsandbytes>=0.45.3  # NF4 4-bit QLoRA (8B on 5070/5070 Ti, all Qwen on the laptop) + 8-bit AdamW; sm_120 (RTX 50xx) kernels
 ultralytics>=8.4.0  # YOLO "-cls" classification backbones (MODEL_CHOICE = "yolo"); YOLO26 (MODEL_CHOICE = "yolo26") needs >=8.4.0
+pyyaml>=6.0  # MS-MGCA-Qwen3-VL experiment configs (experiments/MS-MGCA-Qwen3-VL/configs/*.yaml)
 albumentations>=1.4.0
 stringzilla>=3.10.4,<4.0.0
 opencv-python-headless>=4.9.0

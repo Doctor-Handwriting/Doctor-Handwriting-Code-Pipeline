@@ -118,6 +118,16 @@ experiments/MS-MGCA-Qwen3-VL/
 
 ## 4. Quick Start & Execution Guide
 
+### 4.0 Running through the main pipeline (recommended for comparable results)
+The model is integrated into the repository's `main.py`. Set `MODEL_CHOICE = "ms-mgca"`, the ablation in
+`MSMGCA_EXPERIMENT` (`e1_baseline` ... `e6_full_model`, the YAML names in `configs/`) and the Qwen3-VL backbone in
+`QWEN_CHECKPOINT`, then run `STAGE = "train"` and `STAGE = "infer"`. This uses the pipeline's data splits
+(RxHand / DHP / combined, online / offline augmentation), metrics, plots and `runs/MS-MGCA-Qwen3-VL/` layout, trains all
+components jointly, and writes confidence metrics at inference. See the repository README, section
+"MS-MGCA-Qwen3-VL". The adapter is `models/ms_mgca.py` in the repository root; this package is imported unchanged.
+
+The standalone scripts below keep working and use this package's own RxHand split.
+
 Activate the Conda environment:
 ```powershell
 conda activate doctor_vlm

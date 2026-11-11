@@ -27,6 +27,9 @@ from models.models import (
     CRNNProcessor, YOLOProcessor, build_charset, build_class_list, load_crnn, load_qwen_vl,
     load_yolo_classifier, save_crnn, save_yolo,
 )
+from models.ms_mgca import (
+    confidence_report, load_ms_mgca, load_ms_mgca_weights, ms_mgca_param_groups, save_ms_mgca, square_pad,
+)
 from utils.dataset_parser import (
     apply_offline_dataset, build_offline_dataset, missing_offline_manifests, parse_all_datasets, save_dataset_json,
 )
@@ -55,12 +58,27 @@ STAGE = "train"  # Options: "augment", "train", "infer"
 #                sizes n/s/m/l/x); per-size batch/accumulation for each hardware profile and per-size
 #                learning rate: YOLO26Config + HardwareProfile.yolo26_micro_batch. Same closed-vocabulary
 #                ceiling as "yolo".
-MODEL_CHOICE = "crnn"  # Options: "qwen-vl", "crnn", "yolo", "yolo26"
+#   "ms-mgca" -> MS-MGCA-Qwen3-VL (experiments/MS-MGCA-Qwen3-VL): Qwen3-VL + LoRA with multi-scale gated fusion,
+#                medication-guided cross-attention and an uncertainty-aware confidence head. The ablation (E1-E6) is
+#                MSMGCA_EXPERIMENT and the backbone is QWEN_CHECKPOINT (a Qwen3-VL model). Trains with batch 1 x
+#                gradient accumulation (its multi-scale path handles one image at a time); the infer stage also
+#                reports the confidence head's calibration and the share of predictions flagged for review.
+MODEL_CHOICE = "crnn"  # Options: "qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"
 # Used when MODEL_CHOICE == "qwen-vl". Any Qwen2.5-VL / Qwen3-VL checkpoint, e.g.
 #   "Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"
 # (8B needs a 12GB+ profile and trains as 4-bit QLoRA; 2B/4B train in plain bf16 on pc_5070ti;
 #  use a 2B/3B model on the 4GB laptop).
 QWEN_CHECKPOINT = "Qwen/Qwen3-VL-8B-Instruct"
+# Used when MODEL_CHOICE == "ms-mgca": which ablation of experiments/MS-MGCA-Qwen3-VL/configs/ to run
+#   "e1_baseline"             Qwen3-VL + LoRA only (reference)
+#   "e2_multiscale"           + multi-scale gated fusion (Component A)
+#   "e3_cross_attention"      + medication-guided cross-attention (Component B)
+#   "e4_confidence"           + uncertainty-aware confidence head (Component D)
+#   "e5_multiscale_crossattn" A + B
+#   "e6_full_model"           A + B + D = the full proposed model
+# All components train jointly with LoRA. Each experiment/backbone gets its own run folder
+# (run_<time>_<profile>_<experiment>_<size>...), and STAGE = "infer" evaluates the latest run of the chosen one.
+MSMGCA_EXPERIMENT = "e6_full_model"
 # Used when MODEL_CHOICE == "yolo": must be a classification model, one of
 #   yolov8n-cls.pt | yolov8s-cls.pt | yolov8m-cls.pt | yolov8l-cls.pt | yolov8x-cls.pt
 YOLO_CHECKPOINT = "yolov8m-cls.pt"
@@ -81,7 +99,7 @@ HARDWARE_PROFILE = "pc_5070"
 # For "rxhand", RXHAND_OFFICIAL_SPLIT = True trains on RxHand's Train_Set and validates on its Test_Set
 # instead of re-splitting them together. Non-combined runs get the mode in their run folder name
 # (run_<timestamp>_<profile>_dhp), so separate experiments never overwrite each other.
-DATASET_MODE = "dhp"  # Options: "combined", "dhp", "rxhand"
+DATASET_MODE = "rxhand"  # Options: "combined", "dhp", "rxhand"
 RXHAND_OFFICIAL_SPLIT = False
 # How training images are augmented:
 #   "online"  -> random transforms applied to each training image on the fly (nothing stored on disk, a new
@@ -118,12 +136,29 @@ def limit_image_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
     return image.resize((max(28, int(w * scale)), max(28, int(h * scale))), Image.BICUBIC)
 
 
+def prepare_ms_mgca_image(image: Image.Image, max_pixels: int, multiscale: bool) -> Image.Image:
+    """Image as MS-MGCA sees it: square-padded when the multi-scale module is on, then pixel-limited."""
+    image = image.convert("RGB")
+    if multiscale:
+        image = square_pad(image)
+    return limit_image_pixels(image, max_pixels)
+
+
 @torch.no_grad()
 def generate_text(model, processor, image: Image.Image, prompt: str,
-                  max_pixels: int, max_new_tokens: int) -> str:
-    """Greedy-decode the model's transcription for a single image."""
+                  max_pixels: int, max_new_tokens: int) -> Tuple[str, Dict]:
+    """Greedy-decode the model's transcription for a single image.
+    Returns (text, extra): extra holds model-specific fields for the results (MS-MGCA: confidence, requires_review)."""
     if isinstance(processor, (CRNNProcessor, YOLOProcessor)):
-        return processor.transcribe(model, image)
+        return processor.transcribe(model, image), {}
+
+    if hasattr(model, "generate_with_confidence"):  # MS-MGCA-Qwen3-VL
+        out = model.generate_with_confidence(
+            prepare_ms_mgca_image(image, max_pixels, model.multiscale_enabled),
+            prompt=prompt, max_new_tokens=max_new_tokens)
+        extra = {"confidence": out["confidence"], "requires_review": out["requires_review"]} \
+            if model.uncertainty_enabled else {}
+        return out["prediction"], extra
 
     text = processor.apply_chat_template(
         build_messages(prompt), tokenize=False, add_generation_prompt=True
@@ -136,7 +171,7 @@ def generate_text(model, processor, image: Image.Image, prompt: str,
 
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, use_cache=True)
     new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-    return processor.decode(new_tokens, skip_special_tokens=True).strip()
+    return processor.decode(new_tokens, skip_special_tokens=True).strip(), {}
 
 
 def run_generation_eval(model, processor, records: List[Dict], max_pixels: int,
@@ -154,7 +189,7 @@ def run_generation_eval(model, processor, records: List[Dict], max_pixels: int,
             continue
 
         prompt = record["conversations"][0]["value"]
-        generated_text = generate_text(model, processor, image, prompt, max_pixels, max_new_tokens)
+        generated_text, extra = generate_text(model, processor, image, prompt, max_pixels, max_new_tokens)
         ground_truth = record["conversations"][1]["value"]
         results.append({
             "image_id": record["id"],
@@ -164,6 +199,7 @@ def run_generation_eval(model, processor, records: List[Dict], max_pixels: int,
             "correct": TextMetrics.is_match(generated_text, ground_truth),
             "correct_normalized": TextMetrics.is_match(generated_text, ground_truth, normalized=True),
             "cer": TextMetrics.compute_cer([generated_text], [ground_truth]) if ground_truth else None,
+            **extra,
         })
 
     if was_training:
@@ -285,7 +321,8 @@ class GenerationEvalTrainer(Trainer):
         labels = inputs.get("labels")
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
 
-        logits = getattr(outputs, "logits", None)
+        # HF model outputs expose .logits; MS-MGCA returns a dict.
+        logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
         if self.track_token_accuracy and labels is not None and logits is not None:
             with torch.no_grad():
                 preds = logits[:, :-1].argmax(dim=-1)
@@ -330,6 +367,29 @@ class GenerationEvalTrainer(Trainer):
         return output
 
 
+class MSMGCATrainer(GenerationEvalTrainer):
+    """GenerationEvalTrainer for MS-MGCA-Qwen3-VL, whose model is a plain nn.Module around a PEFT backbone:
+      - checkpoints hold only the LoRA adapter + MS-MGCA modules (not the whole backbone)
+      - the best checkpoint is reloaded with the same loader (load_best_model_at_end)
+      - one AdamW group per component, each with its own learning rate (the experiment's recipe)."""
+
+    def _save(self, output_dir=None, state_dict=None):
+        output_dir = output_dir or self.args.output_dir
+        save_ms_mgca(self.model, output_dir)
+
+    def _load_best_model(self):
+        logger.info(f"Loading best MS-MGCA checkpoint from {self.state.best_model_checkpoint} "
+                    f"(score: {self.state.best_metric})")
+        load_ms_mgca_weights(self.model, self.state.best_model_checkpoint)
+
+    def create_optimizer(self, model=None):
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                ms_mgca_param_groups(self.model, self.args.learning_rate),
+                weight_decay=self.args.weight_decay)
+        return self.optimizer
+
+
 class QwenVLCollator:
     """Runs the processor on the whole batch so every model-specific key
     (pixel_values, image_grid_thw, mm_token_type_ids, ...) is passed through untouched."""
@@ -361,6 +421,26 @@ class QwenVLCollator:
         inputs["labels"] = labels
 
         return dict(inputs)
+
+
+class MSMGCACollator(QwenVLCollator):
+    """QwenVLCollator plus what the MS-MGCA model's forward needs: the prepared PIL images (`raw_images`, source of
+    the multi-scale crops) and, when the confidence head is on, per-sample correctness targets.
+    Targets are 1.0: as in the experiment's own trainer, teacher-forced ground-truth answers count as correct."""
+
+    def __init__(self, processor, max_pixels: int, multiscale: bool, confidence: bool):
+        # Plain flags, not the model: DataLoader workers pickle the collator.
+        super().__init__(processor, max_pixels)
+        self.multiscale = multiscale
+        self.confidence = confidence
+
+    def __call__(self, batch: List[Dict]) -> Dict:
+        images = [prepare_ms_mgca_image(item["image"], self.max_pixels, self.multiscale) for item in batch]
+        out = super().__call__([{**item, "image": image} for item, image in zip(batch, images)])
+        out["raw_images"] = images
+        if self.confidence:
+            out["correctness_targets"] = torch.ones(len(batch))
+        return out
 
 
 class CRNNCollator:
@@ -511,6 +591,10 @@ def train_stage(cfg: PipelineConfig) -> None:
     if cfg.model_type == "qwen-vl":
         model, processor = load_qwen_vl(cfg)
         collator = QwenVLCollator(processor, cfg.model.max_pixels)
+    elif cfg.is_ms_mgca:
+        model, processor = load_ms_mgca(cfg)
+        collator = MSMGCACollator(processor, cfg.model.max_pixels,
+                                  multiscale=model.multiscale_enabled, confidence=model.uncertainty_enabled)
     elif cfg.model_type == "crnn":
         # CTC needs a fixed character set: every character that appears in any label.
         model, processor = load_crnn(cfg, charset=build_charset(train_records + val_records))
@@ -571,7 +655,8 @@ def train_stage(cfg: PipelineConfig) -> None:
         dataloader_pin_memory=cfg.training.pin_memory,
         # Windows spawns workers slowly (~6s each); keep them alive across epochs/evals.
         dataloader_persistent_workers=cfg.training.num_workers > 0,
-        gradient_checkpointing=cfg.training.gradient_checkpointing,
+        # MS-MGCA enables checkpointing on its backbone inside the loader (its wrapper has no such method for the Trainer).
+        gradient_checkpointing=cfg.training.gradient_checkpointing and not cfg.is_ms_mgca,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=cfg.training.max_grad_norm,
         seed=cfg.training.seed,
@@ -580,7 +665,8 @@ def train_stage(cfg: PipelineConfig) -> None:
         disable_tqdm=False,
     )
 
-    trainer = GenerationEvalTrainer(
+    trainer_class = MSMGCATrainer if cfg.is_ms_mgca else GenerationEvalTrainer
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -590,7 +676,7 @@ def train_stage(cfg: PipelineConfig) -> None:
         gen_eval_records=gen_eval_records,
         max_pixels=cfg.model.max_pixels,
         max_new_tokens=cfg.evaluation.max_new_tokens,
-        track_token_accuracy=cfg.model_type == "qwen-vl",
+        track_token_accuracy=cfg.model_type in ("qwen-vl", "ms-mgca"),
     )
     trainer.remove_callback(ProgressCallback)
     trainer.add_callback(MetricsProgressCallback())
@@ -625,6 +711,8 @@ def train_stage(cfg: PipelineConfig) -> None:
         save_crnn(model, processor, final_dir)
     elif cfg.is_yolo:
         save_yolo(model, processor, Path(cfg.yolo_checkpoint).stem, final_dir)
+    elif cfg.is_ms_mgca:
+        save_ms_mgca(model, final_dir)
     else:
         model.save_pretrained(final_dir)
     logger.info(f"Model saved to {final_dir}")
@@ -641,9 +729,9 @@ def infer_stage(cfg: PipelineConfig) -> None:
 
     adapter_path = cfg.evaluation.adapter_path
     if not os.path.isdir(adapter_path):
-        if cfg.model_type == "crnn" or cfg.is_yolo:
+        if cfg.model_type == "crnn" or cfg.is_yolo or cfg.is_ms_mgca:
             # Unlike Qwen's adapter, these have no usable base model to fall back to (the CRNN is random,
-            # the YOLO classifier has no head for our vocabulary).
+            # the YOLO classifier has no head for our vocabulary, MS-MGCA's modules are untrained).
             raise FileNotFoundError(f"No trained {cfg.model_type} model at {adapter_path}. "
                                     f"Run STAGE = \"train\" first.")
         logger.warning(f"No trained adapter at {adapter_path}; evaluating the base model")
@@ -652,6 +740,8 @@ def infer_stage(cfg: PipelineConfig) -> None:
     logger.info("Loading model and processor...")
     if cfg.model_type == "qwen-vl":
         model, processor = load_qwen_vl(cfg, adapter_path=adapter_path)
+    elif cfg.is_ms_mgca:
+        model, processor = load_ms_mgca(cfg, checkpoint_dir=adapter_path)
     elif cfg.model_type == "crnn":
         model, processor = load_crnn(cfg, checkpoint_dir=adapter_path)
     elif cfg.is_yolo:
@@ -668,7 +758,7 @@ def infer_stage(cfg: PipelineConfig) -> None:
     sample_records = val_records[:n_samples] if n_samples else val_records
     logger.info(f"Evaluating on {len(sample_records)} validation samples")
 
-    use_amp = torch.cuda.is_available() and cfg.model_type == "qwen-vl"  # CRNN runs in fp32
+    use_amp = torch.cuda.is_available() and cfg.model_type in ("qwen-vl", "ms-mgca")  # CRNN runs in fp32
     with torch.autocast("cuda", dtype=cfg.compute_dtype, enabled=use_amp):
         metrics, results = run_generation_eval(
             model, processor, sample_records, cfg.model.max_pixels,
@@ -695,6 +785,15 @@ def infer_stage(cfg: PipelineConfig) -> None:
         if plot_final_metrics(metrics, plot_file, f"Inference metrics ({len(results)} samples)"):
             logger.info(f"Metrics chart saved to {plot_file}")
 
+    # MS-MGCA with the confidence head: how well confidence separates right from wrong transcriptions.
+    report = confidence_report(model, results) if cfg.is_ms_mgca else None
+    if report:
+        logger.info(format_metrics_table(report, "CONFIDENCE METRICS"))
+        confidence_file = os.path.join(cfg.run_dir, "inference_confidence_metrics.json")
+        with open(confidence_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Confidence metrics saved to {confidence_file}")
+
 
 def main():
     """Main pipeline orchestrator."""
@@ -706,7 +805,7 @@ def main():
         dataset=DatasetConfig(mode=DATASET_MODE, rxhand_official_split=RXHAND_OFFICIAL_SPLIT),
         augmentation=AugmentationConfig(mode=AUGMENTATION_MODE),
         model=ModelConfig(qwen_checkpoint=QWEN_CHECKPOINT, yolo_checkpoint=YOLO_CHECKPOINT,
-                          yolo26_checkpoint=YOLO26_CHECKPOINT),
+                          yolo26_checkpoint=YOLO26_CHECKPOINT, ms_mgca_experiment=MSMGCA_EXPERIMENT),
     )
 
     logger.info("\n" + "=" * 60)

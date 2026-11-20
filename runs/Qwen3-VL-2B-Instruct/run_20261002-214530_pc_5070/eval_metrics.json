@@ -1,0 +1,15 @@
+{
+  "eval_loss": 0.8003735542297363,
+  "eval_token_accuracy": 0.8754269279165917,
+  "eval_wer": 0.45614035087719296,
+  "eval_cer": 0.17415730337078653,
+  "eval_mer": 0.4406779661016949,
+  "eval_wil": 0.6677345537757438,
+  "eval_accuracy": 0.53,
+  "eval_accuracy_normalized": 0.66,
+  "eval_char_accuracy": 0.8258426966292135,
+  "eval_runtime": 93.5122,
+  "eval_samples_per_second": 12.116,
+  "eval_steps_per_second": 3.037,
+  "epoch": 10.0
+}

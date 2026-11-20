@@ -21,7 +21,7 @@ vlm_pipeline/
 ├── models/
 │   ├── __init__.py
 │   ├── models.py          # Qwen-VL, CRNN, and YOLO/YOLO26 model loaders
-│   └── ms_mgca.py         # Adapter that plugs experiments/MS-MGCA-Qwen3-VL into the pipeline
+│   └── ms_mgca.py         # Adapter that plugs experiments/MS-MGCA-Qwen3-VL into the pipeline (+ confidence calibration)
 ├── experiments/
 │   ├── MS-MGCA-Qwen3-VL/  # Proposed model: code, E1-E6 ablation configs, unit tests (own README)
 │   └── <model_name>/      # Per-model progress notes copied from finished runs (see experiments/README.md)
@@ -30,7 +30,10 @@ vlm_pipeline/
 │   ├── dataset_parser.py  # DHP + RxHand parsing to instruction format
 │   ├── augmentor.py       # Medical handwriting augmentations
 │   ├── metrics.py         # WER, CER, and accuracy computation
-│   └── visualization.py   # Loss/accuracy/CER/WER/LR training plots
+│   ├── visualization.py   # Loss/accuracy/CER/WER/LR training plots
+│   └── confidence_plots.py  # Reliability diagram + risk-coverage curve (MS-MGCA confidence head)
+├── run_ms_mgca_ablations.py  # Runs E1-E6 (or the K sweep) end to end: train -> calibrate -> infer
+├── compare_ms_mgca.py     # Ablation table + comparison plots over the finished MS-MGCA runs
 ├── Augmented_Dataset/     # AUGMENTATION_MODE = "offline" only (created by STAGE = "augment", git-ignored)
 │   ├── DHP/    {original/, augmented/, augmentation_manifest.json}
 │   └── RxHand/ {original/, augmented/, augmentation_manifest.json}
@@ -205,11 +208,61 @@ Pick the ablation with `MSMGCA_EXPERIMENT` and the backbone with `QWEN_CHECKPOIN
 MODEL_CHOICE = "ms-mgca"
 QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"   # any Qwen3-VL checkpoint; 2B trains in plain bf16 on pc_5070
 MSMGCA_EXPERIMENT = "e6_full_model"
-STAGE = "train"   # then "infer"
+MSMGCA_NUM_QUERIES = None   # medication queries K (E3/E5/E6): None = 4, or 1 / 4 / 8 for the K sweep
+STAGE = "train"   # then "calibrate" (E4/E6 only), then "infer"
 ```
 
+Every one of these constants can also be passed on the command line instead of editing `main.py`
+(`python main.py --help`):
+
+```bash
+python main.py --model ms-mgca --experiment e6_full_model --checkpoint Qwen/Qwen3-VL-2B-Instruct --stage train
+python main.py --model ms-mgca --experiment e6_full_model --checkpoint Qwen/Qwen3-VL-2B-Instruct --stage calibrate
+python main.py --model ms-mgca --experiment e6_full_model --checkpoint Qwen/Qwen3-VL-2B-Instruct --stage infer
+```
+
+### Full ablation (E1-E6) and report
+
+```bash
+python run_ms_mgca_ablations.py                       # E1..E6: train -> calibrate (E4/E6 only) -> infer, 2B backbone
+python run_ms_mgca_ablations.py --sweep-k 1 4 8       # E6 with K = 1, 4, 8
+python run_ms_mgca_ablations.py --checkpoint Qwen/Qwen3-VL-4B-Instruct   # the same with the 4B backbone
+python compare_ms_mgca.py                             # table + plots in runs/MS-MGCA-Qwen3-VL/ablation_report/
+```
+
+**Resuming after an interruption** (MS-MGCA only): add `--resume` to the same command (and the same `--epochs`).
+
+```bash
+python run_ms_mgca_ablations.py --resume              # or: python main.py ... --stage train --resume
+```
+
+`train` finds the newest run of that exact setting (model, experiment, backbone, K, dataset, augmentation), restores
+the LoRA/module weights, optimizer, learning-rate schedule and step counter from its latest `checkpoint-<step>`, and
+continues in the same run folder (the plots and `metrics_history` keep the earlier steps; only the steps after the
+checkpoint are repeated). Stages whose output already exists are skipped: a finished training, a `calibrated/`
+checkpoint, an `inference_metrics.json`. With no earlier run it simply starts a new one. `--epochs` must match the
+original run, otherwise the learning-rate schedule would change, so the run is refused with a message.
+Checkpoints are written every `save_steps` (100) optimizer steps, so at most that much work is lost.
+
+All runs of one ablation share backbone, dataset, augmentation and seed (3407; the random initialisation of the new
+modules is seeded too), so the rows of the table differ only in the architecture. `compare_ms_mgca.py` writes
+`ablation_table.md/.csv` (exact match, normalized match, CER, WER, latency, peak VRAM, ECE, Brier, error-detection
+AUROC, review rate), `metrics_comparison.png`, one `reliability_<run>.png` per confidence-aware run and
+`risk_coverage_comparison.png`. Use `--dataset` / `--size` to compare only runs of one setting.
+
 - **Training** fine-tunes LoRA and all enabled MS-MGCA components jointly. Each component has its own learning
-  rate from the experiment config (LoRA 2e-4, adapters 5e-4, confidence head 1e-3).
+  rate from the experiment config (LoRA 2e-4, adapters 5e-4, confidence head 1e-3). With the confidence head the loss
+  is `L_text + lambda_c * L_conf`; during training a sample counts as correct (z = 1) when the model's teacher-forced
+  prediction reproduces every answer token, which is only a proxy on data the model is fitting (see calibration).
+  Checkpoints are selected on the text loss alone.
+- **Calibration (`STAGE = "calibrate"`, E4/E6):** the confidence head must learn whether a *generated* transcription
+  is right, which needs labels from images the model did not train on. The stage transcribes the validation images
+  (never trained on), labels each transcription right/wrong (exact match), splits them once into a calibration part
+  (`EvaluationConfig.calibration_fraction`, default 50%) and a held-out part, fits the head on the calibration part
+  with BCE, and reports ECE / Brier / AUROC on the held-out part before and after
+  (`calibration_metrics.json`, `plots/reliability_*_calibration.png`). The result is saved as
+  `checkpoints/calibrated/`, which the infer stage then uses, scoring confidence on the held-out part only.
+  This is a one-fold hold-out version of out-of-fold calibration (a true K-fold would retrain the model K times).
 - **Batch size:** the multi-scale / cross-attention path handles one image at a time, so MS-MGCA always uses
   micro-batch 1 with gradient accumulation (effective batch 8 on every profile, same as the other models).
   It needs a GPU with bf16 support.
@@ -220,7 +273,12 @@ STAGE = "train"   # then "infer"
   rebuilds the architecture from that saved config.
 - **Confidence head (E4, E6):** `inference_results.json` gets `confidence` and `requires_review` per sample
   (flagged when confidence < the experiment's threshold, default 0.70), and the infer stage writes
-  `inference_confidence_metrics.json` (Brier score, ECE, error-detection AUROC, review rate, risk-coverage curve).
+  `inference_confidence_metrics.json` (Brier score, ECE, error-detection AUROC, review rate, risk-coverage curve) plus
+  `plots/reliability_diagram.png` and `plots/risk_coverage.png`. Without a calibrated checkpoint the head is the
+  jointly trained one and is scored on all validation images, which the file records under `evaluated_on`.
+- **Every MS-MGCA infer run** also writes `inference_efficiency.json` (latency per sample, peak GPU memory).
+- **K sweep:** `MSMGCA_NUM_QUERIES` (or `--queries`) sets the number of medication queries; the run folder ends in
+  `_k<K>`, so the three runs do not overwrite each other.
 - **Images:** with multi-scale fusion on, non-square images are padded to a square on white (the RxHand crops are
   already square, so they are unchanged), because the fusion maps local crops onto a square token grid.
 - The experiment's own scripts (`training/train_stage.py` progressive stages 2-5, `evaluation/evaluate.py`,

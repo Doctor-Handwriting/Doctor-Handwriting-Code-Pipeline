@@ -23,4 +23,4 @@ experiments/
 2. Copy **only** the small files: `run_config.json`, `*_metrics.json`, `plots/`.
    Never copy `checkpoints/` (too large for git).
 3. Add one row to that model's `README.md` table (who, date, dataset, metrics, status).
-4. Plots used in the paper go to `paper/manuscript/figures/`.
+4. Plots used in the paper go to `paper/manuscript/fig/`.

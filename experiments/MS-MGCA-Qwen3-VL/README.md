@@ -123,8 +123,10 @@ The model is integrated into the repository's `main.py`. Set `MODEL_CHOICE = "ms
 `MSMGCA_EXPERIMENT` (`e1_baseline` ... `e6_full_model`, the YAML names in `configs/`) and the Qwen3-VL backbone in
 `QWEN_CHECKPOINT`, then run `STAGE = "train"` and `STAGE = "infer"`. This uses the pipeline's data splits
 (RxHand / DHP / combined, online / offline augmentation), metrics, plots and `runs/MS-MGCA-Qwen3-VL/` layout, trains all
-components jointly, and writes confidence metrics at inference. See the repository README, section
-"MS-MGCA-Qwen3-VL". The adapter is `models/ms_mgca.py` in the repository root; this package is imported unchanged.
+components jointly, and writes confidence metrics at inference. `STAGE = "calibrate"` (E4/E6) fits the confidence
+head on real right/wrong transcriptions of held-out images, `run_ms_mgca_ablations.py` runs E1-E6 (and the K sweep)
+end to end and `compare_ms_mgca.py` builds the comparison table, reliability diagrams and risk-coverage curves.
+See the repository README, section "MS-MGCA-Qwen3-VL". The adapter is `models/ms_mgca.py` in the repository root; this package is imported unchanged.
 
 The standalone scripts below keep working and use this package's own RxHand split.
 

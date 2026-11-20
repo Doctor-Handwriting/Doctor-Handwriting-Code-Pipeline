@@ -13,7 +13,7 @@
 \usepackage{textcomp}
 \usepackage{array}
 \usepackage{xcolor}
-\graphicspath{{figures/}}
+\graphicspath{{fig/}}
 
 % --- hyperref: keep LAST. Clickable citations/cross-refs, no boxes or colors.
 \usepackage[hidelinks]{hyperref}
@@ -74,12 +74,32 @@ TODO: Abstract.
 TODO: keywords.
 \end{IEEEkeywords}
 
+\section{Introduction}\label{sec:introduction}
+Interpreting doctor medication prescription handwriting sometime can be a problem for pharmacist that could lead to false medication given by the pharmacist. According to data from Institute of Medicine United States, 7.000 preventable death caused by false medication from unreadable prescriptions \cite{achkar2019medical}. Manual eye interpretation is taking a long time to identify and not efficient, so there is an urgency for algorithm or system that could help identify the prescription faster than human eyes and brain can do. There's a computer vision model called YOLO that stands for You Only Look Once that in some research already used in medical use case but less on interpreting doctor prescription and to solve that gap this paper is focusing on evaluate YOLOv26 performance in interpreting doctor prescription.\cite{sapkota2025yolo26}. In the other hand they also advancement in the computer vision that combine with LLM which is VLM or Vision Language Model. Thus, the purpose of this paper is to experiment wether YOLOv26 can increase the accuracy detection and develop a Vision Language Model. There is also a another ar
+% TODO: the last sentence above is cut off in the Prism draft ("There is also a another ar").
+
+\section{Related Work}\label{sec:related-work}
+\subsection{YOLO}
+There are some research that are using YOLOv11 variant combined with OCR plus correction that proven increasing precision from $81.5\%$ to $94.1\%$, recall from $77.3\%$ to $91.3\%$, and F1 Score from $0.79\%$ to $0.92\%$ compared to untouch baseline YOLOv11 model \cite{jeevidha2026advanced}. Furthermore, some researcher also use VGG16 combined with BiLSTM that show 45 correct out of 50 test dataset on doctor prescriptions text with a $10\%$ error rate \cite{achkar2019medical}. and also and option for resource less model there is also paper that state using simple three layer RNN but it also come with drawbacks which is less accurate the model only get 0.483877 roughly 0.5 of validation loss and that translate to a 50 50 accuracy guessing \cite{shaw2021medical}.
+
+\subsection{QWEN 3 VL}
+In addition some research use QWEN3-VL a dedicated vision language model from alibaba that have superiority in scalable and robust performance in VQA task ranging from 2 billion parameter to 235 billion parameter. But with hardware constraint added to the equation, we decide to use 2 billion, 4 billion and 8 billion parameter for our experiment. \cite{lopez2026comparative}
+
+\subsection{Convolutional Recurrent Neural Network}
+% TODO: write this subsection.
+
+\section{Methodology}\label{sec:methodology}
+\subsection{Dataset}
+The dataset we use in this research is open source, one collected from kaggle containing 89 picture of doctor handwriting medical prescriptions from 30 different doctors in Nawabshah, Pakistan. Each medicine name is written by 3 doctors, providing various handwriting strokes and diversity with label for each image respectively. And the second dataset collected from zenodo.com that called RxHandBD: A Handwritten Prescription Word Image Dataset containing  5,578 images and 1,559 distinct text labels the dataset containing generic medicines, pharmaceutical brands, dosage forms, and clinical instructions. Later on dataset will be divided to 80/20 data split for training and tesing with the first data will containing 72 images for training and 18 images for testing. And the second dataset containing 4,463 images for training and 1,115 images for testing
+% TODO (draft notes from Prism): VLM
+% TODO (draft notes from Prism): LoRA
+
 % Uncomment a section once it has content, so the PDF has no empty headings.
-\input{sections/01-introduction}
-\input{sections/02-related-work}
-\input{sections/03-methodology}
-% \input{sections/04-results}
-% \input{sections/05-conclusion}
+% \section{Result and Analysis}\label{sec:results}
+% TODO: write the results section.
+
+% \section{Conclusion}\label{sec:conclusion}
+% TODO: write the Conclusion section.
 
 % TODO: acknowledgment (unnumbered in IEEE), uncomment when written:
 % \section*{Acknowledgment}

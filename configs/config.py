@@ -173,6 +173,13 @@ def find_latest_run(model_dir: Path, tag: str = "") -> Optional[Path]:
     return max(finals, key=lambda p: p.stat().st_mtime).parent.parent if finals else None
 
 
+def find_run_by_suffix(model_dir: Path, suffix: str) -> Optional[Path]:
+    """Newest run folder (finished or not) whose name ends with `suffix`, e.g. "_pc_5070_e1_baseline_2B_rxhand_offline".
+    Run names start with a timestamp, so the newest sorts last. Used by --resume to find the run to continue."""
+    runs = [p for p in model_dir.glob("run_*") if p.is_dir() and p.name.endswith(suffix)]
+    return max(runs, key=lambda p: p.name) if runs else None
+
+
 def detect_hardware_profile() -> str:
     """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070).
     A "16GB" card reports ~15.9GiB and a "12GB" one ~11.9GiB, hence the thresholds."""
@@ -316,6 +323,13 @@ class EvaluationConfig:
     max_new_tokens: int = 64
     # Adapter loaded by the "infer" stage (defaults to <checkpoint_dir>/final).
     adapter_path: str = ""
+    # MS-MGCA confidence calibration (STAGE = "calibrate"): the held-out val set is split once into a calibration
+    # part (fits the confidence head on the model's real right/wrong transcriptions) and an evaluation part
+    # (reports ECE / Brier / AUROC, and is what the infer stage scores the confidence on).
+    calibration_fraction: float = 0.5
+    calibration_steps: int = 300       # AdamW steps on the cached features (no VLM forward, takes seconds)
+    calibration_lr: float = 1e-3
+    calibration_seed: int = 3407
 
 
 @dataclass
@@ -400,6 +414,9 @@ class ModelConfig:
     # MODEL_CHOICE = "ms-mgca": which ablation (E1-E6) to build; one of MSMGCA_EXPERIMENTS. The backbone is
     # qwen_checkpoint (must be a Qwen3-VL model).
     ms_mgca_experiment: str = "e6_full_model"
+    # Number of medication queries K of the cross-attention (E3/E5/E6; the paper sweeps 1, 4, 8).
+    # None = the value in the experiment YAML (4). Part of the run folder name when set (..._k8).
+    ms_mgca_num_queries: Optional[int] = None
     # Must be an ultralytics *classification* checkpoint (name ends with "-cls"), e.g.
     # yolov8n-cls.pt / yolov8s-cls.pt / yolov8m-cls.pt / yolov8l-cls.pt / yolov8x-cls.pt.
     yolo_checkpoint: str = "yolov8m-cls.pt"
@@ -414,7 +431,10 @@ class ModelConfig:
 @dataclass
 class PipelineConfig:
     """Master pipeline configuration."""
-    stage: Literal["augment", "train", "infer"] = "train"
+    stage: Literal["augment", "train", "calibrate", "infer"] = "train"
+    # --resume (MS-MGCA): train continues the newest run of this exact setting from its latest checkpoint (a new run
+    # when there is none); a stage whose output already exists is skipped (see main.py).
+    resume: bool = False
     hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
     model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"] = "qwen-vl"
     device: str = "cuda"
@@ -467,11 +487,13 @@ class PipelineConfig:
 
     @property
     def run_tag(self) -> str:
-        """Run-folder fragment that keeps MS-MGCA ablations and backbones apart, e.g. "_e6_full_model_2B"."""
+        """Run-folder fragment that keeps MS-MGCA ablations and backbones apart, e.g. "_e6_full_model_2B"
+        ("_e6_full_model_2B_k8" when the number of medication queries is overridden)."""
         if not self.is_ms_mgca:
             return ""
         size_b = qwen_params_billions(self.model.qwen_checkpoint)
-        return f"_{self.model.ms_mgca_experiment}_{f'{size_b:g}B' if size_b else 'custom'}"
+        k = f"_k{self.model.ms_mgca_num_queries}" if self.model.ms_mgca_num_queries else ""
+        return f"_{self.model.ms_mgca_experiment}_{f'{size_b:g}B' if size_b else 'custom'}{k}"
 
     @property
     def is_yolo(self) -> bool:
@@ -504,7 +526,12 @@ class PipelineConfig:
         """Derive this run's folder and its sub-folders (directories are created by the stages)."""
         model_dir = Path(self.output_dir) / self.model_name
         if not self.run_name:
-            latest = find_latest_run(model_dir, self.run_tag) if self.stage == "infer" else None
+            latest = find_latest_run(model_dir, self.run_tag) if self.stage in ("calibrate", "infer") else None
+            if self.resume and self.stage == "train":
+                latest = find_run_by_suffix(
+                    model_dir, f"_{self.hardware_profile}{self.run_tag}{self.dataset.mode_tag}{self.augmentation.mode_tag}")
+                if latest is None:
+                    print("[resume] No earlier run of this setting found; starting a new run.")
             self.run_name = latest.name if latest else (
                 f"run_{datetime.now():%Y%m%d-%H%M%S}_{self.hardware_profile}{self.run_tag}"
                 f"{self.dataset.mode_tag}{self.augmentation.mode_tag}")
@@ -594,6 +621,9 @@ class PipelineConfig:
         if self.model.ms_mgca_experiment not in MSMGCA_EXPERIMENTS:
             raise ValueError(f"Unknown MS-MGCA experiment '{self.model.ms_mgca_experiment}'. "
                              f"Options: {', '.join(MSMGCA_EXPERIMENTS)}")
+        k = self.model.ms_mgca_num_queries
+        if k is not None and k < 1:
+            raise ValueError(f"MSMGCA_NUM_QUERIES must be a positive integer (1, 4 or 8 in the paper), got {k}.")
         if "qwen3" not in self.model.qwen_checkpoint.lower():
             raise ValueError(f"MS-MGCA needs a Qwen3-VL backbone, got '{self.model.qwen_checkpoint}' "
                              f"(set QWEN_CHECKPOINT in main.py, e.g. Qwen/Qwen3-VL-2B-Instruct).")

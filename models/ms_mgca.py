@@ -86,6 +86,8 @@ def build_ms_mgca_config(cfg, checkpoint_dir: Optional[str] = None):
     saved = Path(checkpoint_dir) / CONFIG_FILE if checkpoint_dir else None
     msc = exp.MSMGCAConfig.from_yaml(str(saved if saved and saved.is_file() else experiment_yaml(cfg.model.ms_mgca_experiment)))
 
+    if cfg.model.ms_mgca_num_queries and not checkpoint_dir:  # a trained checkpoint keeps the K it was trained with
+        msc.cross_attention.num_queries = cfg.model.ms_mgca_num_queries
     msc.model.checkpoint = cfg.model.qwen_checkpoint
     msc.model.load_in_4bit = cfg.quantization.load_in_4bit
     msc.model.bnb_4bit_compute_dtype = "bfloat16"
@@ -211,12 +213,121 @@ def square_pad(image: Image.Image) -> Image.Image:
     return canvas
 
 
-def confidence_report(experiment_model, results: List[Dict]) -> Optional[Dict]:
+# --------------------------------------------------------------------------------------------------------------
+# Confidence calibration (STAGE = "calibrate")
+#
+# Component D must learn whether a *generated* transcription is right. That needs real right/wrong labels z_i from
+# predictions the model did not train on (training images are mostly transcribed correctly, so their labels would
+# say "always right"). The val set is that held-out data: it is split once into a calibration part (fits the head)
+# and an evaluation part (reports ECE / Brier / AUROC, never seen by the head).
+# --------------------------------------------------------------------------------------------------------------
+CALIBRATED_DIR = "calibrated"
+CALIBRATION_SPLIT_FILE = "calibration_split.json"
+
+
+def calibration_split(ids: List[str], fraction: float, seed: int) -> Tuple[List[str], List[str]]:
+    """Deterministic split of record ids into (calibration ids, held-out evaluation ids)."""
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"calibration_fraction must be between 0 and 1, got {fraction}")
+    order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(seed)).tolist()
+    n_cal = min(max(int(round(len(ids) * fraction)), 1), len(ids) - 1)
+    return [ids[i] for i in order[:n_cal]], [ids[i] for i in order[n_cal:]]
+
+
+class capture_pooled_features:
+    """Context manager collecting the pooled decoder representation h that the confidence head receives at every
+    generate_with_confidence() call (hook on the head, so the experiment's code is untouched)."""
+
+    def __init__(self, model):
+        self.head = model.uncertainty_decoder.confidence_head
+        self.features: List[torch.Tensor] = []
+
+    def __enter__(self):
+        self._handle = self.head.register_forward_hook(
+            lambda _m, inputs, _out: self.features.append(inputs[0].detach().float().cpu().reshape(-1)))
+        return self.features
+
+    def __exit__(self, *exc):
+        self._handle.remove()
+
+
+def head_scores(model, features: torch.Tensor) -> torch.Tensor:
+    """Confidence c = sigmoid(head(h)) for cached features [N, D], computed in fp32."""
+    import copy
+    head = copy.deepcopy(model.uncertainty_decoder.confidence_head).float().eval()
+    device = next(head.parameters()).device
+    with torch.no_grad():
+        return head(features.float().to(device))[1].reshape(-1).cpu()
+
+
+def fit_confidence_head(model, features: torch.Tensor, targets: torch.Tensor,
+                        steps: int = 300, lr: float = 1e-3, seed: int = 3407) -> Optional[Dict]:
+    """Fine-tune the confidence head (warm start = the jointly trained head) with BCE on cached (h, z) pairs, in fp32.
+    20% of the pairs are kept aside to pick the best step, so the head does not memorise a few hundred samples.
+    Returns the fit log, or None (head untouched) when the labels contain a single class."""
+    import copy
+    n = len(targets)
+    n_pos = int(targets.sum().item())
+    if n_pos == 0 or n_pos == n:
+        logger.warning(f"All {n} calibration labels are {'correct' if n_pos else 'wrong'}; a confidence head cannot "
+                       f"be fitted on one class. Head left unchanged.")
+        return None
+
+    live = model.uncertainty_decoder.confidence_head
+    head = copy.deepcopy(live).float()
+    gen = torch.Generator().manual_seed(seed)
+    order = torch.randperm(n, generator=gen)
+    n_val = max(int(0.2 * n), 1) if n >= 10 else 0
+    val_idx, fit_idx = order[:n_val], order[n_val:]
+    device = next(live.parameters()).device
+    x, z = features.float().to(device), targets.float().to(device)
+    head.to(device)
+
+    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-2)
+    best = (float("inf"), copy.deepcopy(head.state_dict()), 0)
+    log = []
+    for step in range(1, steps + 1):
+        head.train()
+        batch = fit_idx[torch.randint(len(fit_idx), (min(64, len(fit_idx)),), generator=gen)]
+        loss = head.compute_loss(head(x[batch])[0], z[batch])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if n_val and (step % 10 == 0 or step == steps):
+            head.eval()
+            with torch.no_grad():
+                val_loss = head.compute_loss(head(x[val_idx])[0], z[val_idx]).item()
+            log.append({"step": step, "train_bce": float(loss.item()), "val_bce": val_loss})
+            if val_loss < best[0]:
+                best = (val_loss, copy.deepcopy(head.state_dict()), step)
+    if n_val:
+        head.load_state_dict(best[1])
+    live.load_state_dict(head.state_dict())  # casts back to the head's bf16
+    return {"samples": n, "positives": n_pos, "best_step": best[2] if n_val else steps,
+            "best_val_bce": best[0] if n_val else None, "log": log}
+
+
+def save_calibrated(model, directory: str, split: Dict) -> None:
+    """Write the calibrated checkpoint (same layout as save_ms_mgca) plus the calibration/evaluation id split."""
+    import json
+    save_ms_mgca(model, directory)
+    (Path(directory) / CALIBRATION_SPLIT_FILE).write_text(json.dumps(split, indent=2), encoding="utf-8")
+
+
+def heldout_ids(checkpoint_dir: str) -> Optional[set]:
+    """Ids the calibrated head never saw (None for an uncalibrated checkpoint)."""
+    import json
+    path = Path(checkpoint_dir) / CALIBRATION_SPLIT_FILE
+    return set(json.loads(path.read_text(encoding="utf-8"))["heldout_ids"]) if path.is_file() else None
+
+
+def confidence_report(experiment_model, results: List[Dict], only_ids: Optional[set] = None) -> Optional[Dict]:
     """Calibration / selective-prediction metrics of the confidence head over infer results
-    (each carrying `confidence` and `correct`). None when this ablation has no confidence head."""
+    (each carrying `confidence` and `correct`), optionally restricted to `only_ids` (the held-out evaluation part).
+    None when this ablation has no confidence head."""
     if not getattr(experiment_model, "uncertainty_enabled", False):
         return None
-    scored = [r for r in results if "confidence" in r]
+    scored = [r for r in results if "confidence" in r and (only_ids is None or r["image_id"] in only_ids)]
     if not scored:
         return None
     return load_experiment().compute_all_confidence_metrics(

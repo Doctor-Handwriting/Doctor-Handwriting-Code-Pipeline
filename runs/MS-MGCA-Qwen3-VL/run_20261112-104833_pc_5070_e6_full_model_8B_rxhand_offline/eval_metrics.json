@@ -1,0 +1,20 @@
+{
+  "eval_loss": 0.6339046955108643,
+  "eval_token_accuracy": 0.8664596273291926,
+  "eval_wer": 0.42201834862385323,
+  "eval_cer": 0.17673048600883653,
+  "eval_mer": 0.41818181818181815,
+  "eval_wil": 0.6520557254502208,
+  "eval_accuracy": 0.58,
+  "eval_accuracy_normalized": 0.68,
+  "eval_char_accuracy": 0.8232695139911634,
+  "eval_num_samples": 100,
+  "eval_num_correct": 58,
+  "eval_num_correct_normalized": 68,
+  "eval_runtime": 674.269,
+  "eval_samples_per_second": 1.655,
+  "eval_steps_per_second": 1.655,
+  "epoch": 10.0,
+  "eval_gt_pred": "100/58",
+  "eval_gt_pred_normalized": "100/68"
+}

@@ -119,7 +119,7 @@ DATASET_MODE = "rxhand"  # Options: "combined", "dhp", "rxhand"
 RXHAND_OFFICIAL_SPLIT = False
 # For "rxhand", RXHAND_HELDOUT_TEST = True splits Train_Set 80/20 into train/val and keeps the official Test_Set
 # for the infer stage only. The split lives in configs/splits/rxhand/ so every machine uses the same images.
-RXHAND_HELDOUT_TEST = False
+RXHAND_HELDOUT_TEST = True
 # How training images are augmented:
 #   "online"  -> random transforms applied to each training image on the fly (nothing stored on disk, a new
 #                variation every epoch, same behaviour as before)
@@ -754,8 +754,9 @@ def train_stage(cfg: PipelineConfig) -> None:
         save_strategy="epoch" if cfg.eval_by_epoch else "steps",
         save_total_limit=cfg.training.save_total_limit,
         load_best_model_at_end=cfg.training.load_best_model_at_end,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        # Val CER from the generation eval, not eval_loss (see TrainingConfig.metric_for_best_model).
+        metric_for_best_model=cfg.training.metric_for_best_model,
+        greater_is_better=cfg.training.greater_is_better,
         fp16=cfg.training.use_fp16,
         bf16=cfg.training.use_bf16,
         dataloader_num_workers=cfg.training.num_workers,
@@ -793,10 +794,11 @@ def train_stage(cfg: PipelineConfig) -> None:
         # Keep the logged history up to the checkpoint; the steps after it are about to be trained again.
         plot_callback.history = [e for e in (load_history(cfg.run_dir) or []) if e.get("step", 0) <= resume_from[1]]
     trainer.add_callback(plot_callback)
-    # Evaluation is per epoch for these models, so patience counts epochs without val-loss improvement
-    # (CRNN: 20 as in the paper).
+    # Patience counts evaluations without a better metric_for_best_model (val CER). CRNN / YOLO evaluate once per
+    # epoch, so theirs is in epochs (CRNN: 20 as in the paper); Qwen-VL / MS-MGCA evaluate every eval_steps.
     patience = (cfg.crnn.early_stopping_patience if cfg.model_type == "crnn"
-                else cfg.yolo_settings.early_stopping_patience if cfg.is_yolo else 0)
+                else cfg.yolo_settings.early_stopping_patience if cfg.is_yolo
+                else cfg.training.early_stopping_patience)
     if patience > 0:
         trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=patience))
 

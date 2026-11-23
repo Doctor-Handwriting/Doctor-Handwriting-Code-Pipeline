@@ -1,0 +1,6 @@
+{
+  "samples": 1116,
+  "latency_ms_per_sample": 570.3039629032082,
+  "throughput_samples_per_sec": 1.7534509052144174,
+  "peak_vram_mb": 6844.287109375
+}

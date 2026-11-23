@@ -94,7 +94,7 @@ HARDWARE_PROFILES = {
         num_workers=2,
         pin_memory=False,
         max_pixels=512 * 512,
-        train_eval_samples=50,
+        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
         allow_tf32=False,
         yolo_batch_size=32,
         # Peak reserved VRAM at 224px, fp16 (measured on this GPU): n 0.45GB, s 0.76, m 1.4, l 1.8 at batch 32;
@@ -116,7 +116,7 @@ HARDWARE_PROFILES = {
         num_workers=4,
         pin_memory=True,
         max_pixels=640 * 640,
-        train_eval_samples=100,
+        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
         allow_tf32=True,
         kbit_upcast_fp32=False,
         quantize_vision=False,
@@ -141,7 +141,7 @@ HARDWARE_PROFILES = {
         num_workers=4,
         pin_memory=True,
         max_pixels=768 * 768,
-        train_eval_samples=100,
+        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
         allow_tf32=True,
         kbit_upcast_fp32=False,
         quantize_vision=False,
@@ -165,7 +165,7 @@ HARDWARE_PROFILES = {
         num_workers=4,
         pin_memory=True,
         max_pixels=768 * 768,
-        train_eval_samples=100,
+        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
         allow_tf32=True,
         kbit_upcast_fp32=False,
         quantize_vision=False,
@@ -247,23 +247,35 @@ class LoRAConfig:
 
 @dataclass
 class TrainingConfig:
-    """Training hyperparameters. Batch/accumulation/precision are overwritten by the hardware profile;
-    the rest follows Table 1 of the paper (7B/8B tier: 10 epochs, lr 2e-4, 8-bit AdamW,
-    cosine with restarts, weight decay 0.01, seed 3407)."""
+    """Training hyperparameters for Qwen-VL / MS-MGCA. Batch/accumulation/precision are overwritten by the hardware
+    profile; CRNN and YOLO replace epochs/lr/schedule with their own recipes (apply_crnn_recipe / apply_yolo_recipe).
+    lr 2e-4, weight decay 0.01 and seed 3407 follow Table 1 of the paper. Epochs and schedule do not: the paper's
+    10 epochs with a warm restart overfit here (E6 8B run_20261112: train loss -> 0.0004, val accuracy flat after
+    ~epoch 2-3 while val loss doubled), because with offline augmentation one epoch already shows every original
+    ~8 times (original + 7 variants)."""
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
-    num_epochs: int = 10
+    num_epochs: int = 3
     learning_rate: float = 2e-4
-    # Paper uses 2000 warmup steps on a far larger synthetic set; here an epoch is only ~560 optimizer
-    # steps (~4.5k train images / batch 8), so warm up over ~5% of the 10-epoch run instead.
+    # Paper uses 2000 warmup steps on a far larger synthetic set; with offline augmentation an epoch is ~3.6k
+    # optimizer steps (~3.6k held-out train originals x 8 views / batch 8), so 300 steps is ~3% of a 3-epoch run.
     warmup_steps: int = 300
     weight_decay: float = 0.01
     optim: str = "adamw_bnb_8bit"  # 8-bit AdamW (bitsandbytes); "adamw_torch" for plain AdamW
-    lr_scheduler_type: str = "cosine_with_restarts"
-    lr_scheduler_num_cycles: int = 2  # one warm restart halfway; paper does not state the cycle count
-    # Keep the checkpoint with the lowest val loss (small dataset + 10 epochs can overfit late),
-    # and keep only the newest few so a long run does not fill the disk.
+    # Single cosine decay: the warm restart of the 10-epoch recipe only re-ran the same descent.
+    lr_scheduler_type: str = "cosine"
+    lr_scheduler_num_cycles: int = 2  # only read when lr_scheduler_type == "cosine_with_restarts"
+    # Checkpoint selection and early stopping use a transcription metric, not eval_loss: on every model trained so
+    # far, val loss started rising (the model grows overconfident on the words it gets wrong) while val CER and
+    # exact match kept improving, so "lowest eval_loss" picked a worse checkpoint (E6 8B: 58% vs 68% exact match).
+    # Applies to every model type (CRNN / YOLO too). eval_cer comes from the generation eval on the val set.
+    metric_for_best_model: str = "eval_cer"
+    greater_is_better: bool = False
+    # Qwen-VL / MS-MGCA: stop after this many evaluations without a better val CER (x eval_steps = 2000 steps,
+    # ~0.55 epoch). 0 disables. CRNN / YOLO keep their own patience (in epochs) from their recipe configs.
+    early_stopping_patience: int = 4
+    # Keep the best checkpoint (always retained) plus the newest few so a long run does not fill the disk.
     load_best_model_at_end: bool = True
     save_total_limit: int = 3
     max_grad_norm: float = 1.0
@@ -355,8 +367,9 @@ class DatasetConfig:
 class EvaluationConfig:
     """Generation-based evaluation (WER/CER/accuracy) settings."""
     # Val samples decoded with model.generate at every eval step during training.
-    # Generation is slow, so keep this small on a 4GB GPU; None = full val set.
-    train_eval_samples: Optional[int] = 50
+    # None = full val set (the default): checkpoint selection and early stopping use val CER, and on a
+    # subset of 50-100 images it is too noisy (+-5 points) to tell checkpoints apart. An int limits it to the first N.
+    train_eval_samples: Optional[int] = None
     # Val samples used by the "infer" stage; None = full val set.
     infer_samples: Optional[int] = None
     max_new_tokens: int = 64
@@ -500,8 +513,10 @@ class PipelineConfig:
     checkpoint_dir: str = ""
     log_dir: str = ""
     plots_dir: str = ""
-    save_steps: int = 100
-    eval_steps: int = 100
+    # Qwen-VL / MS-MGCA evaluate on the full val set (generation included), which takes minutes on a VLM, so every
+    # 500 optimizer steps (~7 evaluations per epoch). save_steps must stay a multiple of eval_steps.
+    save_steps: int = 500
+    eval_steps: int = 500
     log_steps: int = 10
     # Evaluate/checkpoint once per epoch instead of every eval_steps/save_steps (set for the CRNN recipe,
     # whose early stopping counts epochs).

@@ -33,6 +33,8 @@ def main() -> int:
                    help="Qwen3-VL backbone, the same for every run (default: %(default)s)")
     p.add_argument("--dataset", choices=["combined", "dhp", "rxhand"])
     p.add_argument("--augmentation", choices=["online", "offline"])
+    p.add_argument("--heldout-test", action="store_true",
+                   help="RxHand: train/val from Train_Set, infer on the official Test_Set (see docs/how_to_run.md)")
     p.add_argument("--profile", help="hardware profile (default: HARDWARE_PROFILE in main.py)")
     p.add_argument("--epochs", type=int)
     p.add_argument("--resume", action="store_true",
@@ -48,6 +50,8 @@ def main() -> int:
                         ("--augmentation", args.augmentation), ("--profile", args.profile), ("--epochs", args.epochs)):
         if value is not None:
             common += [flag, str(value)]
+    if args.heldout_test:
+        common.append("--heldout-test")
     if args.resume:
         common.append("--resume")
 

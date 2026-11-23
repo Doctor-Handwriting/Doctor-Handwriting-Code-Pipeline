@@ -372,6 +372,76 @@ def apply_offline_dataset(cfg, aug_cfg, train_records: List[Dict],
     return train_out, val_out
 
 
+SPLIT_FILES = ("train", "val", "test")
+
+
+def _split_key(record: Dict, rxhand_root: str) -> str:
+    """Image path relative to the RxHand root ("Train_Set/P0001.jpg"), the key stored in the split files."""
+    return _relative_image_path(record["image"], rxhand_root)
+
+
+def _write_rxhand_split(cfg, train_pool: List[Dict], test_pool: List[Dict]) -> None:
+    """Split Train_Set into train/val (sorted by file, then shuffled with seed 42) and write the split files."""
+    pool = sorted(train_pool, key=lambda r: _split_key(r, cfg.rxhand_root))
+    random.Random(42).shuffle(pool)
+    cut = int(len(pool) * cfg.train_split)
+    splits = {"train": pool[:cut], "val": pool[cut:],
+              "test": sorted(test_pool, key=lambda r: _split_key(r, cfg.rxhand_root))}
+
+    os.makedirs(cfg.rxhand_split_dir, exist_ok=True)
+    for name, records in splits.items():
+        pd.DataFrame({
+            "image": [_split_key(r, cfg.rxhand_root) for r in records],
+            "text": [r["conversations"][1]["value"] for r in records],
+        }).to_csv(os.path.join(cfg.rxhand_split_dir, f"{name}.csv"), index=False, encoding="utf-8")
+    logger.info(f"Wrote RxHand split to {cfg.rxhand_split_dir}: "
+                + ", ".join(f"{k} {len(v)}" for k, v in splits.items()))
+
+
+def load_rxhand_heldout_split(cfg) -> Dict[str, List[Dict]]:
+    """
+    Train/val/test records of the held-out RxHand split, read from cfg.rxhand_split_dir.
+
+    The split files are created on first use. Afterwards they are the source of truth: every listed image
+    must exist under cfg.rxhand_root, so all machines train and test on exactly the same images.
+    """
+    train_pool, test_pool = load_rxhand_dataset(
+        cfg.rxhand_train_labels, cfg.rxhand_test_labels, cfg.rxhand_train_images, cfg.rxhand_test_images)
+    if not train_pool or not test_pool:
+        raise ValueError("The held-out RxHand split needs both Train_Set and Test_Set records, found "
+                         f"{len(train_pool)} train / {len(test_pool)} test")
+
+    files = {name: os.path.join(cfg.rxhand_split_dir, f"{name}.csv") for name in SPLIT_FILES}
+    if not all(os.path.exists(f) for f in files.values()):
+        _write_rxhand_split(cfg, train_pool, test_pool)
+
+    by_key = {_split_key(r, cfg.rxhand_root): r for r in train_pool + test_pool}
+    splits = {}
+    for name, path in files.items():
+        keys = pd.read_csv(path)["image"].astype(str).tolist()
+        missing = [k for k in keys if k not in by_key]
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} images listed in {path} are not in the RxHand dataset at {cfg.rxhand_root} "
+                f"(e.g. {missing[:3]}). Use the same RxHand copy as the rest of the team.")
+        splits[name] = [by_key[k] for k in keys]
+
+    overlap = set(map(id, splits["test"])) & set(map(id, splits["train"] + splits["val"]))
+    if overlap:
+        raise ValueError(f"{len(overlap)} test images also appear in train/val; check {cfg.rxhand_split_dir}")
+
+    logger.info(f"Held-out RxHand split: {len(splits['train'])} train, {len(splits['val'])} val, "
+                f"{len(splits['test'])} test")
+    return splits
+
+
+def parse_test_records(cfg) -> List[Dict]:
+    """Held-out test records (rxhand_heldout_test only); empty for the other dataset setups."""
+    if not getattr(cfg, "rxhand_heldout_test", False):
+        return []
+    return load_rxhand_heldout_split(cfg)["test"]
+
+
 def parse_all_datasets(cfg) -> Tuple[List[Dict], List[Dict]]:
     """
     Parse the datasets selected by cfg.mode and split them into train/val.
@@ -388,6 +458,16 @@ def parse_all_datasets(cfg) -> Tuple[List[Dict], List[Dict]]:
     """
     mode = cfg.mode
     logger.info(f"Dataset mode: {mode}" + (" (official RxHand train/test split)" if cfg.rxhand_official_split else ""))
+
+    if getattr(cfg, "rxhand_heldout_test", False):
+        splits = load_rxhand_heldout_split(cfg)
+        train_records, val_records = splits["train"], splits["val"]
+        if cfg.max_samples:
+            n_train = max(1, int(cfg.max_samples * cfg.train_split))
+            train_records = train_records[:n_train]
+            val_records = val_records[:max(1, cfg.max_samples - n_train)]
+            logger.info(f"Limited dataset to {cfg.max_samples} samples")
+        return train_records, val_records
 
     dhp_records, rxhand_train, rxhand_test = [], [], []
     if mode in ("combined", "dhp"):

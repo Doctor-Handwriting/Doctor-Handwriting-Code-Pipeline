@@ -102,6 +102,30 @@ HARDWARE_PROFILES = {
         # anything past ~4GB spills into shared system memory and trains 10x slower).
         yolo26_micro_batch={"n": 32, "s": 32, "m": 32, "l": 32, "x": 16},
     ),
+    # PC: Ryzen 5 3600 (6C/12T), 32GB RAM, RTX 3070 Ti 8GB (Ampere, sm_86, bf16 supported)
+    # Sized for Qwen3-VL-2B/4B: every Qwen checkpoint trains as QLoRA (2B bf16 weights ~4.4GB leave too little room
+    # for activations in 8GB). Batch 1 x accum 8 keeps the effective batch of 8. Qwen3-VL-8B is not recommended here.
+    "pc_3070ti": HardwareProfile(
+        description="RTX 3070 Ti 8GB / 32GB RAM - Qwen3-VL-2B/4B QLoRA (NF4 + bf16 compute)",
+        load_in_4bit=True,
+        compute_dtype=torch.bfloat16,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=8,
+        gradient_checkpointing=True,
+        num_workers=4,
+        pin_memory=True,
+        max_pixels=640 * 640,
+        train_eval_samples=100,
+        allow_tf32=True,
+        kbit_upcast_fp32=False,
+        quantize_vision=False,
+        max_bf16_params_b=0.0,
+        yolo_batch_size=64,
+        # Extrapolated from the 3050 Ti measurements (activations scale with batch): l ~3.6GB, x ~5.8GB at batch 64.
+        # x runs at 32 x 2 to stay clear of the 8GB limit once Windows takes its share; not measured on this GPU yet.
+        yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 32},
+    ),
     # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
     # Sized for Qwen3-VL-8B: bf16 weights alone are ~16GB, so it runs as QLoRA (NF4 weights ~6-7GB,
     # bf16 compute, vision tower kept in bf16). Batch 2 x accum 4 = the paper's effective batch of 8;
@@ -181,14 +205,16 @@ def find_run_by_suffix(model_dir: Path, suffix: str) -> Optional[Path]:
 
 
 def detect_hardware_profile() -> str:
-    """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070).
-    A "16GB" card reports ~15.9GiB and a "12GB" one ~11.9GiB, hence the thresholds."""
+    """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070, >=7GB -> pc_3070ti).
+    A "16GB" card reports ~15.9GiB, a "12GB" one ~11.9GiB and an "8GB" one ~8.0GiB, hence the thresholds."""
     if not torch.cuda.is_available():
         return "laptop_3050ti"
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
     if vram_gb >= 14:
         return "pc_5070ti"
-    return "pc_5070" if vram_gb >= 10 else "laptop_3050ti"
+    if vram_gb >= 10:
+        return "pc_5070"
+    return "pc_3070ti" if vram_gb >= 7 else "laptop_3050ti"
 
 
 @dataclass
@@ -272,6 +298,11 @@ class DatasetConfig:
     # mode == "rxhand" only: train on RxHand's official Train_Set and validate on its Test_Set instead of
     # re-splitting them together (the DHP dataset has no official split).
     rxhand_official_split: bool = False
+    # mode == "rxhand" only: Train_Set is split into train/val (train_split, seed 42) and the official Test_Set is
+    # kept as a held-out test set that only the infer stage reads. The split is written once to rxhand_split_dir
+    # (train.csv / val.csv / test.csv, committed to git) and read back from there, so every machine uses the same images.
+    rxhand_heldout_test: bool = False
+    rxhand_split_dir: str = (PROJECT_ROOT / "configs" / "splits" / "rxhand").as_posix()
 
     train_split: float = 0.80
     val_split: float = 0.20
@@ -282,6 +313,10 @@ class DatasetConfig:
             raise ValueError(f"Unknown dataset mode '{self.mode}'. Options: combined, dhp, rxhand")
         if self.rxhand_official_split and self.mode != "rxhand":
             raise ValueError("rxhand_official_split only applies to dataset mode 'rxhand'")
+        if self.rxhand_heldout_test and self.mode != "rxhand":
+            raise ValueError("rxhand_heldout_test only applies to dataset mode 'rxhand'")
+        if self.rxhand_heldout_test and self.rxhand_official_split:
+            raise ValueError("Choose either rxhand_official_split or rxhand_heldout_test, not both")
         root = Path(self.dataset_root)
         self.dhp_root = self.dhp_root or (root / "DHP").as_posix()
         self.dhp_labels = self.dhp_labels or (Path(self.dhp_root) / "doctor_handwriting_labels.csv").as_posix()
@@ -299,7 +334,11 @@ class DatasetConfig:
         """Suffix for run folder names; empty for the default combined setup."""
         if self.mode == "combined":
             return ""
-        return f"_{self.mode}" + ("-official" if self.rxhand_official_split else "")
+        if self.rxhand_official_split:
+            return f"_{self.mode}-official"
+        if self.rxhand_heldout_test:
+            return f"_{self.mode}-heldout"
+        return f"_{self.mode}"
 
     def missing_paths(self) -> List[str]:
         """Return expected dataset files/folders (of the datasets the mode uses) that do not exist."""
@@ -526,7 +565,9 @@ class PipelineConfig:
         """Derive this run's folder and its sub-folders (directories are created by the stages)."""
         model_dir = Path(self.output_dir) / self.model_name
         if not self.run_name:
-            latest = find_latest_run(model_dir, self.run_tag) if self.stage in ("calibrate", "infer") else None
+            # Held-out runs only evaluate models trained on the held-out split: older runs saw Test_Set images.
+            tag = self.run_tag + (self.dataset.mode_tag if self.dataset.rxhand_heldout_test else "")
+            latest = find_latest_run(model_dir, tag) if self.stage in ("calibrate", "infer") else None
             if self.resume and self.stage == "train":
                 latest = find_run_by_suffix(
                     model_dir, f"_{self.hardware_profile}{self.run_tag}{self.dataset.mode_tag}{self.augmentation.mode_tag}")

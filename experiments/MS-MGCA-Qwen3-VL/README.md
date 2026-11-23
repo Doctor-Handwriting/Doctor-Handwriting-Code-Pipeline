@@ -127,8 +127,14 @@ components jointly, and writes confidence metrics at inference. `STAGE = "calibr
 head on real right/wrong transcriptions of held-out images, `run_ms_mgca_ablations.py` runs E1-E6 (and the K sweep)
 end to end and `compare_ms_mgca.py` builds the comparison table, reliability diagrams and risk-coverage curves.
 See the repository README, section "MS-MGCA-Qwen3-VL". The adapter is `models/ms_mgca.py` in the repository root; this package is imported unchanged.
+For paper numbers use the team split: `--dataset rxhand --heldout-test` (see `docs/how_to_run.md`).
 
-The standalone scripts below keep working and use this package's own RxHand split.
+The standalone scripts below keep working and use this package's own RxHand split (80/20 of `Train_Set`, seed 3407,
+`Test_Set` as test), so their numbers are not comparable with `main.py` runs.
+
+Dataset and output paths are not stored in the YAML files: `configs/base_config.py` resolves them on each machine
+to `<repo>/Dataset/RxHand` and `<repo>/runs/MS-MGCA-Qwen3-VL` (or `$VLM_DATASET_ROOT/RxHand` when that is set).
+The experiment code needs `transformers` 5.18 (pinned in `requirements.txt`).
 
 Activate the Conda environment:
 ```powershell

@@ -2,6 +2,12 @@
 
 Production-ready handwriting-recognition training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** and larger RTX 5070/5070 Ti systems. It supports Qwen-VL, the proposed MS-MGCA-Qwen3-VL, the paper-based CRNN, and YOLO/YOLO26 classification models.
 
+## Docs
+
+- [docs/MODEL_STATUS.md](docs/MODEL_STATUS.md): models already run and not yet run, with results and datasets
+- [docs/how_to_run.md](docs/how_to_run.md): commands for every stage and model
+- [docs/NOTEBOOK_GUIDE.md](docs/NOTEBOOK_GUIDE.md): running training from Jupyter / Colab / Kaggle, hardware profiles
+
 ## Features
 
 - **Memory-Optimized**: 4-bit quantization (NF4), LoRA adaptation, gradient checkpointing
@@ -14,17 +20,19 @@ Production-ready handwriting-recognition training pipeline optimized for **RTX 3
 ## Project Structure
 
 ```
-vlm_pipeline/
+Doctor-Handwriting-Code-Pipeline/
 ├── configs/
 │   ├── __init__.py
-│   └── config.py          # Dataclass configs (hardware, LoRA, training, paths)
+│   ├── config.py          # Dataclass configs (hardware, LoRA, training, paths)
+│   └── splits/rxhand/     # train.csv / val.csv / test.csv of the held-out RxHand split (committed)
+├── docs/                  # MODEL_STATUS.md, how_to_run.md, NOTEBOOK_GUIDE.md
+├── paper/                 # LaTeX manuscript (manuscript/) and reference PDFs (references/)
 ├── models/
 │   ├── __init__.py
 │   ├── models.py          # Qwen-VL, CRNN, and YOLO/YOLO26 model loaders
 │   └── ms_mgca.py         # Adapter that plugs experiments/MS-MGCA-Qwen3-VL into the pipeline (+ confidence calibration)
 ├── experiments/
-│   ├── MS-MGCA-Qwen3-VL/  # Proposed model: code, E1-E6 ablation configs, unit tests (own README)
-│   └── <model_name>/      # Per-model progress notes copied from finished runs (see experiments/README.md)
+│   └── MS-MGCA-Qwen3-VL/  # Proposed model: code, E1-E6 ablation configs, unit tests (own README)
 ├── utils/
 │   ├── __init__.py
 │   ├── dataset_parser.py  # DHP + RxHand parsing to instruction format
@@ -37,11 +45,12 @@ vlm_pipeline/
 ├── Augmented_Dataset/     # AUGMENTATION_MODE = "offline" only (created by STAGE = "augment", git-ignored)
 │   ├── DHP/    {original/, augmented/, augmentation_manifest.json}
 │   └── RxHand/ {original/, augmented/, augmentation_manifest.json}
-├── runs/                  # Outputs, one folder per model per run
+├── Dataset/               # DHP/ and RxHand/ (not committed, see "Dataset Location")
+├── runs/                  # Outputs, one folder per model per run (committed except model weights)
 │   ├── train_augmented.json, val_augmented.json   # augment stage
 │   └── <model_name>/                               # e.g. Qwen3-VL-8B-Instruct
-│       └── run_<YYYYmmdd-HHMMSS>_<profile>/
-│           ├── checkpoints/        # checkpoint-*/ and final/ (LoRA adapter)
+│       └── run_<YYYYmmdd-HHMMSS>_<profile>[_<dataset>[-heldout]][_offline]/
+│           ├── checkpoints/        # checkpoint-*/ and final/ (LoRA adapter; weight files are git-ignored)
 │           ├── logs/               # TensorBoard events
 │           ├── plots/              # loss, accuracy, error_rates, learning_rate, training_overview,
 │           │                       # evaluation_metrics (every metric), final_metrics, inference_metrics .png
@@ -50,7 +59,7 @@ vlm_pipeline/
 │           ├── eval_metrics.json   # final evaluation
 │           ├── run_config.json     # full config snapshot of the run
 │           └── inference_results.json, inference_metrics.json   # infer stage
-├── main.py                # Pipeline orchestrator (augment/train/infer)
+├── main.py                # Pipeline orchestrator (augment/train/calibrate/infer)
 └── requirements.txt       # All dependencies
 ```
 
@@ -107,13 +116,34 @@ The pipeline automatically:
 - Parses RxHand (Handwritten Prescription) dataset splits
 - Filters corrupted `.trashed-*` files
 - Creates multimodal instruction JSON format
-- Splits into 80% train / 20% validation by default (seed 42)
+- Splits the data into train / validation (and test, with the held-out split below)
 
-Select the data setup at the top of `main.py`:
+**Team standard from now on: RxHand with the held-out split** (`--dataset rxhand --heldout-test`, or
+`DATASET_MODE = "rxhand"` + `RXHAND_HELDOUT_TEST = True` in `main.py`):
 
-- `DATASET_MODE = "combined"` merges DHP and RxHand before one split.
-- `DATASET_MODE = "dhp"` or `"rxhand"` trains on one dataset only.
-- With `DATASET_MODE = "rxhand"`, `RXHAND_OFFICIAL_SPLIT = True` uses RxHand's `Train_Set` and `Test_Set` instead of re-splitting.
+| Part | Content | Used by |
+|---|---|---|
+| train | 80% of `Train_Set` | `train` |
+| val | 20% of `Train_Set` | `train` (checkpoint selection), `calibrate` |
+| test | official `Test_Set`, untouched | `infer` only |
+
+The image lists are stored in `configs/splits/rxhand/{train,val,test}.csv` and committed, so every machine uses
+the same images. They are written on the first held-out run (files sorted by name, shuffled with seed 42) and read
+back afterwards; a listed image missing on disk stops the run, which means that machine has a different RxHand copy.
+Held-out runs are named `..._rxhand-heldout`, and `infer` only picks held-out runs, never older ones that saw
+`Test_Set` during training.
+
+Other setups (used by the runs before the held-out split, no separate test set):
+
+| Setting | Split |
+|---|---|
+| `DATASET_MODE = "combined"` | DHP + RxHand merged, then 80% train / 20% val (seed 42) |
+| `DATASET_MODE = "dhp"` / `"rxhand"` | one dataset only, `Train_Set` + `Test_Set` merged, then 80 / 20 (seed 42) |
+| `"rxhand"` + `RXHAND_OFFICIAL_SPLIT = True` | train = `Train_Set`, val = `Test_Set` (test images also pick the checkpoint) |
+
+Results from these setups are not directly comparable with held-out runs. The standalone scripts in
+`experiments/MS-MGCA-Qwen3-VL/` (`evaluation/evaluate.py`, ...) use their own split (seed 3407); report paper
+numbers from `main.py --stage infer --heldout-test`. Details: [docs/how_to_run.md](docs/how_to_run.md).
 
 ### 2. Run Pipeline
 
@@ -131,7 +161,7 @@ MODEL_CHOICE = "qwen-vl"  # or "ms-mgca", "crnn", "yolo", "yolo26"
 QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"  # backbone for "qwen-vl" and "ms-mgca" (Qwen3-VL only)
 MSMGCA_EXPERIMENT = "e6_full_model"   # used when MODEL_CHOICE = "ms-mgca": e1_baseline ... e6_full_model
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOICE = "yolo26"
-HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_5070", "auto"
+HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_3070ti", "pc_5070", "auto"
 DATASET_MODE = "combined"  # or "dhp" / "rxhand" to train and validate on one dataset only
 RXHAND_OFFICIAL_SPLIT = False  # "rxhand" only: True = train on Train_Set, validate on Test_Set
 AUGMENTATION_MODE = "online"  # or "offline": pre-computed Augmented_Dataset/ (run STAGE = "augment" first)
@@ -177,8 +207,9 @@ the `_mixed` variant.
 (`yolo26{n,s,m,l,x}-cls.pt`, 3.6M-30.4M parameters) as a closed-vocabulary word recognizer: each distinct
 training label is a class. Ultralytics has no text-generating YOLO26 variant (the open-vocabulary YOLOE-26 models
 are box detectors), so classification is the only YOLO26 task that fits box-less word labels. Every size runs on
-all three profiles at the same effective batch (32 laptop / 64 `pc_5070` / 128 `pc_5070ti`); on the 4GB laptop
-`yolo26x` uses 16 x 2 gradient accumulation, everything else fits in one pass.
+every profile at the same effective batch per profile (32 laptop / 64 `pc_3070ti` / 64 `pc_5070` / 128 `pc_5070ti`);
+`yolo26x` uses gradient accumulation on the 4GB laptop (16 x 2) and on `pc_3070ti` (32 x 2), everything else fits
+in one pass.
 
 **Inference Stage:**
 ```bash
@@ -291,12 +322,13 @@ Edit `configs/config.py` to customize:
 
 ### Hardware Profiles
 
-Set `HARDWARE_PROFILE` in `main.py` to `auto`, `laptop_3050ti`, `pc_5070`, or `pc_5070ti`.
+Set `HARDWARE_PROFILE` in `main.py` to `auto`, `laptop_3050ti`, `pc_3070ti`, `pc_5070`, or `pc_5070ti`.
 The selected profile supplies batch size, accumulation, workers, image resolution, and precision:
 
 | Profile | Precision | Train batch x accumulation | Max image pixels |
 |---|---|---:|---:|
 | `laptop_3050ti` | 4-bit NF4 + fp16 | 1 x 8 | 512 x 512 |
+| `pc_3070ti` | NF4 QLoRA + bf16 for Qwen3-VL-2B/4B (8B not recommended) | 1 x 8 | 640 x 640 |
 | `pc_5070` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 2 x 4 | 768 x 768 |
 | `pc_5070ti` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 4 x 2 | 768 x 768 |
 

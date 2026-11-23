@@ -10,7 +10,9 @@ runs/MS-MGCA-Qwen3-VL/ and writes, to runs/MS-MGCA-Qwen3-VL/ablation_report/:
 Run it after the infer stage of the experiments you want to compare:
     python compare_ms_mgca.py                                  # every experiment found
     python compare_ms_mgca.py --dataset rxhand --size 2B       # only runs on one dataset / backbone size
-Runs are only comparable when dataset, augmentation, backbone and seed match; the table shows all four.
+    python compare_ms_mgca.py --dataset rxhand --split heldout # only runs scored on the held-out Test_Set
+Runs are only comparable when dataset, split, augmentation, backbone and seed match; the table shows all of them.
+Split "heldout" is scored on the test set, the others on the validation set.
 """
 import argparse
 import csv
@@ -39,6 +41,15 @@ def read_json(path: Path) -> Optional[Dict]:
         return None
 
 
+def split_name(dataset: Dict) -> str:
+    """How the run split its data: "heldout" (scored on Test_Set), "official" or "resplit" (scored on val)."""
+    if dataset.get("rxhand_heldout_test"):
+        return "heldout"
+    if dataset.get("rxhand_official_split"):
+        return "official"
+    return "resplit"
+
+
 def describe(run: Path) -> Optional[Dict]:
     """One row of facts about a finished run, or None when it has no inference results."""
     metrics = read_json(run / "inference_metrics.json")
@@ -53,7 +64,7 @@ def describe(run: Path) -> Optional[Dict]:
     return {
         "run": run.name, "path": run, "experiment": experiment, "label": LABELS.get(experiment, experiment),
         "K": model.get("ms_mgca_num_queries") or "", "size": f"{size:g}B" if size else "custom",
-        "dataset": dataset.get("mode", "?"), "augmentation": config.get("augmentation", {}).get("mode", "?"),
+        "dataset": dataset.get("mode", "?"), "split": split_name(dataset), "augmentation": config.get("augmentation", {}).get("mode", "?"),
         "seed": config.get("training", {}).get("seed", ""),
         "exact_match": metrics.get("accuracy"), "normalized_match": metrics.get("accuracy_normalized"),
         "cer": metrics.get("cer"), "wer": metrics.get("wer"),
@@ -68,18 +79,20 @@ def describe(run: Path) -> Optional[Dict]:
     }
 
 
-def latest_runs(root: Path, dataset: Optional[str], size: Optional[str]) -> List[Dict]:
-    """Newest finished run per (experiment, K, backbone, dataset, augmentation)."""
+def latest_runs(root: Path, dataset: Optional[str], size: Optional[str], split: Optional[str] = None) -> List[Dict]:
+    """Newest finished run per (experiment, K, backbone, dataset, split, augmentation)."""
     chosen: Dict[tuple, Dict] = {}
     for run in sorted(root.glob("run_*")):  # names start with a timestamp, so later runs overwrite earlier ones
         row = describe(run)
-        if not row or (dataset and row["dataset"] != dataset) or (size and row["size"] != size):
+        if (not row or (dataset and row["dataset"] != dataset) or (size and row["size"] != size)
+                or (split and row["split"] != split)):
             continue
-        chosen[(row["experiment"], row["K"], row["size"], row["dataset"], row["augmentation"])] = row
-    return sorted(chosen.values(), key=lambda r: (r["size"], r["dataset"], r["augmentation"], r["experiment"], str(r["K"])))
+        chosen[(row["experiment"], row["K"], row["size"], row["dataset"], row["split"], row["augmentation"])] = row
+    return sorted(chosen.values(),
+                  key=lambda r: (r["size"], r["dataset"], r["split"], r["augmentation"], r["experiment"], str(r["K"])))
 
 
-COLUMNS = [("label", "Exp"), ("K", "K"), ("size", "Backbone"), ("dataset", "Data"), ("augmentation", "Aug"),
+COLUMNS = [("label", "Exp"), ("K", "K"), ("size", "Backbone"), ("dataset", "Data"), ("split", "Split"), ("augmentation", "Aug"),
            ("seed", "Seed"), ("exact_match", "Exact match"), ("normalized_match", "Norm. match"), ("cer", "CER"),
            ("wer", "WER"), ("latency_ms", "ms/sample"), ("peak_vram_mb", "Peak VRAM MB"), ("ece", "ECE"),
            ("brier", "Brier"), ("auroc", "Err. AUROC"), ("review_rate", "Review rate"),
@@ -137,10 +150,12 @@ def main() -> int:
     p.add_argument("--runs-dir", default=str(Path(OUTPUT_ROOT) / MODEL_DIR), help="folder holding the run_* folders")
     p.add_argument("--dataset", choices=["combined", "dhp", "rxhand"], help="only runs on this dataset")
     p.add_argument("--size", help="only runs with this backbone size, e.g. 2B or 4B")
+    p.add_argument("--split", choices=["heldout", "official", "resplit"],
+                   help="only runs with this split (heldout = scored on the held-out Test_Set)")
     args = p.parse_args()
 
     root = Path(args.runs_dir)
-    rows = latest_runs(root, args.dataset, args.size)
+    rows = latest_runs(root, args.dataset, args.size, args.split)
     if not rows:
         print(f"No finished MS-MGCA runs (with inference_metrics.json) under {root}. "
               f"Train and infer first: python main.py --model ms-mgca --experiment e1_baseline --stage train / infer")
@@ -160,10 +175,10 @@ def main() -> int:
 
     print((out / "ablation_table.md").read_text(encoding="utf-8"))
     print(f"Report written to {out}")
-    mixed = {(r["size"], r["dataset"], r["augmentation"], r["seed"]) for r in rows}
+    mixed = {(r["size"], r["dataset"], r["split"], r["augmentation"], r["seed"]) for r in rows}
     if len(mixed) > 1:
-        print("NOTE: the rows differ in backbone / dataset / augmentation / seed, so they are not all directly comparable "
-              "(use --dataset / --size to pick one setting).")
+        print("NOTE: the rows differ in backbone / dataset / split / augmentation / seed, so they are not all directly "
+              "comparable (use --dataset / --split / --size to pick one setting).")
     return 0
 
 

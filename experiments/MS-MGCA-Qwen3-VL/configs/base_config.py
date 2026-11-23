@@ -12,7 +12,20 @@ import torch
 
 # Root of the entire Doctor-Handwriting-Code-Pipeline repository
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-DATASET_ROOT = PROJECT_ROOT / "Dataset" / "RxHand"
+# Same rule as the pipeline (configs/config.py): <repo>/Dataset, or VLM_DATASET_ROOT when set.
+DATASET_ROOT = Path(os.environ.get("VLM_DATASET_ROOT", PROJECT_ROOT / "Dataset")).resolve() / "RxHand"
+# Machine-specific paths, so never read from or written to the experiment YAML files.
+MACHINE_PATH_KEYS = {
+    "dataset": ("dataset_root", "train_labels", "test_labels", "train_images", "test_images"),
+    "training": ("output_dir",),
+}
+
+
+def _drop_machine_paths(data: Dict) -> Dict:
+    for section, keys in MACHINE_PATH_KEYS.items():
+        for key in keys:
+            (data.get(section) or {}).pop(key, None)
+    return data
 
 
 @dataclass
@@ -77,18 +90,25 @@ class UncertaintyConfig:
 
 @dataclass
 class DatasetConfig:
-    """RxHand dataset paths and parameters."""
+    """RxHand dataset paths and parameters. Paths are resolved on each machine from DATASET_ROOT."""
     dataset_root: str = str(DATASET_ROOT)
-    train_labels: str = str(DATASET_ROOT / "Train_Label.csv")
-    test_labels: str = str(DATASET_ROOT / "Test_Labels.csv")
-    train_images: str = str(DATASET_ROOT / "Train_Set")
-    test_images: str = str(DATASET_ROOT / "Test_Set")
+    train_labels: str = ""
+    test_labels: str = ""
+    train_images: str = ""
+    test_images: str = ""
     train_split: float = 0.80
     val_split: float = 0.20
     seed: int = 3407
     max_train_samples: Optional[int] = None
     max_val_samples: Optional[int] = None
     max_test_samples: Optional[int] = None
+
+    def __post_init__(self):
+        root = Path(self.dataset_root)
+        self.train_labels = self.train_labels or str(root / "Train_Label.csv")
+        self.test_labels = self.test_labels or str(root / "Test_Labels.csv")
+        self.train_images = self.train_images or str(root / "Train_Set")
+        self.test_images = self.test_images or str(root / "Test_Set")
 
 
 @dataclass
@@ -128,14 +148,17 @@ class MSMGCAConfig:
         return asdict(self)
 
     def save_yaml(self, path: str):
+        """Write the config without machine-specific paths, so the file works on any machine."""
+        data = _drop_machine_paths(self.to_dict())
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
     @classmethod
     def from_yaml(cls, path: str) -> "MSMGCAConfig":
+        """Load a config. Dataset/output paths in the file (older saves) are ignored and resolved for this machine."""
         with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
+            raw = _drop_machine_paths(yaml.safe_load(f))
 
         return cls(
             model=ModelConfig(**raw.get("model", {})),

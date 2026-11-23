@@ -35,7 +35,8 @@ from models.ms_mgca import (
     save_ms_mgca, square_pad,
 )
 from utils.dataset_parser import (
-    apply_offline_dataset, build_offline_dataset, missing_offline_manifests, parse_all_datasets, save_dataset_json,
+    apply_offline_dataset, build_offline_dataset, missing_offline_manifests, parse_all_datasets, parse_test_records,
+    save_dataset_json,
 )
 from utils.augmentor import get_augmentor
 from utils.confidence_plots import plot_reliability_diagram, plot_risk_coverage
@@ -98,10 +99,11 @@ MSMGCA_NUM_QUERIES = None
 YOLO_CHECKPOINT = "yolov8m-cls.pt"
 # Used when MODEL_CHOICE == "yolo26": must be a YOLO26 classification model, one of
 #   yolo26n-cls.pt (3.6M params) | yolo26s-cls.pt (7.5M) | yolo26m-cls.pt (12.4M) | yolo26l-cls.pt (14.9M) | yolo26x-cls.pt (30.4M)
-# (all five fit all three profiles; weights are downloaded on first use).
+# (all five fit every hardware profile; weights are downloaded on first use).
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"
 # Options: "auto"         -> pick by detected GPU VRAM
 #          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
+#          "pc_3070ti"     -> RTX 3070 Ti 8GB / 32GB RAM (Qwen 2B/4B QLoRA, bf16 compute, batch 1x8)
 #          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
 #          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
 # Profiles are defined in configs/config.py (HARDWARE_PROFILES).
@@ -115,6 +117,9 @@ HARDWARE_PROFILE = "pc_5070"
 # (run_<timestamp>_<profile>_dhp), so separate experiments never overwrite each other.
 DATASET_MODE = "rxhand"  # Options: "combined", "dhp", "rxhand"
 RXHAND_OFFICIAL_SPLIT = False
+# For "rxhand", RXHAND_HELDOUT_TEST = True splits Train_Set 80/20 into train/val and keeps the official Test_Set
+# for the infer stage only. The split lives in configs/splits/rxhand/ so every machine uses the same images.
+RXHAND_HELDOUT_TEST = False
 # How training images are augmented:
 #   "online"  -> random transforms applied to each training image on the fly (nothing stored on disk, a new
 #                variation every epoch, same behaviour as before)
@@ -597,6 +602,16 @@ def load_records(cfg: PipelineConfig) -> Tuple[List[Dict], List[Dict]]:
     return train_records, val_records
 
 
+def load_eval_records(cfg: PipelineConfig) -> Tuple[List[Dict], str]:
+    """Records the infer stage scores: the held-out test set when RXHAND_HELDOUT_TEST is on, otherwise val."""
+    test_records = parse_test_records(cfg.dataset)
+    if not test_records:
+        return load_records(cfg)[1], "validation"
+    if cfg.augmentation.mode == "offline":
+        _, test_records = apply_offline_dataset(cfg.dataset, cfg.augmentation, [], test_records)
+    return test_records, "test"
+
+
 def augment_stage(cfg: PipelineConfig) -> None:
     """Stage 1: Generate augmented dataset."""
     logger.info("=" * 60)
@@ -940,11 +955,11 @@ def infer_stage(cfg: PipelineConfig) -> None:
     model.eval()
 
     logger.info("Parsing datasets...")
-    _, val_records = load_records(cfg)
+    eval_records, eval_split = load_eval_records(cfg)
 
     n_samples = cfg.evaluation.infer_samples
-    sample_records = val_records[:n_samples] if n_samples else val_records
-    logger.info(f"Evaluating on {len(sample_records)} validation samples")
+    sample_records = eval_records[:n_samples] if n_samples else eval_records
+    logger.info(f"Evaluating on {len(sample_records)} {eval_split} samples")
 
     use_amp = torch.cuda.is_available() and cfg.model_type in ("qwen-vl", "ms-mgca")  # CRNN runs in fp32
     if torch.cuda.is_available():
@@ -991,7 +1006,8 @@ def infer_stage(cfg: PipelineConfig) -> None:
 
     # MS-MGCA with the confidence head: how well confidence separates right from wrong transcriptions.
     # With a calibrated checkpoint the head was fitted on the calibration part, so only the held-out part counts.
-    held = heldout_ids(adapter_path) if cfg.is_ms_mgca and adapter_path else None
+    # On the held-out test set every image is unseen by calibration, so no filtering is needed.
+    held = heldout_ids(adapter_path) if cfg.is_ms_mgca and adapter_path and eval_split == "validation" else None
     report = confidence_report(model, results, only_ids=held) if cfg.is_ms_mgca else None
     if report:
         scope = f"held-out part ({report['num_samples']} images)" if held else f"all {report['num_samples']} images"
@@ -1024,6 +1040,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--augmentation", choices=["online", "offline"], help=f"AUGMENTATION_MODE (default {AUGMENTATION_MODE})")
     p.add_argument("--official-split", action="store_true", default=None,
                    help=f"RXHAND_OFFICIAL_SPLIT = True (default {RXHAND_OFFICIAL_SPLIT})")
+    p.add_argument("--heldout-test", action="store_true", default=None,
+                   help=f"RXHAND_HELDOUT_TEST = True (default {RXHAND_HELDOUT_TEST})")
     p.add_argument("--resume", action="store_true",
                    help="MS-MGCA: continue an interrupted run. train picks up the newest run of this exact setting "
                         "(model, experiment, backbone, K, dataset, augmentation) from its latest checkpoint, with the "
@@ -1045,7 +1063,8 @@ def main(argv=None):
         hardware_profile=pick(args.profile, HARDWARE_PROFILE),
         # Passed at construction: the run folder name is derived from the checkpoint and dataset mode.
         dataset=DatasetConfig(mode=pick(args.dataset, DATASET_MODE),
-                              rxhand_official_split=pick(args.official_split, RXHAND_OFFICIAL_SPLIT)),
+                              rxhand_official_split=pick(args.official_split, RXHAND_OFFICIAL_SPLIT),
+                              rxhand_heldout_test=pick(args.heldout_test, RXHAND_HELDOUT_TEST)),
         augmentation=AugmentationConfig(mode=pick(args.augmentation, AUGMENTATION_MODE)),
         model=ModelConfig(qwen_checkpoint=pick(args.checkpoint, QWEN_CHECKPOINT), yolo_checkpoint=YOLO_CHECKPOINT,
                           yolo26_checkpoint=YOLO26_CHECKPOINT,

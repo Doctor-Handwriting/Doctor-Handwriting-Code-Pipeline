@@ -1,26 +1,16 @@
-# Experiments — progress per model
+# Experiments
 
-One folder per model, named exactly like the pipeline's `cfg.model_name`, so it matches
-`runs/<model_name>/` (which is git-ignored because it holds checkpoints).
+Folder ini berisi kode model eksperimen, bukan hasil training.
 
 ```
 experiments/
-├── Qwen3-VL-2B-Instruct/
-├── Qwen3-VL-4B-Instruct/
-├── Qwen3-VL-8B-Instruct/
-├── CRNN/
-├── MS-MGCA-Qwen3-VL/     # also holds the model's source code; runs are named run_<time>_<profile>_<experiment>_<size>...
-└── yolo26m-cls/          # add yolo26n-cls/, yolo26s-cls/, ... if other sizes are trained
-    ├── README.md         # progress table: one row per run
-    └── run_<YYYYmmdd-HHMMSS>_<profile>/   # copied from runs/<model>/<run>/
-        ├── run_config.json
-        ├── eval_metrics.json / inference_metrics.json
-        └── plots/*.png
+└── MS-MGCA-Qwen3-VL/   # model usulan: arsitektur, config E1–E6, dataset, training, test
 ```
 
-## After every finished run
-1. Create `experiments/<model_name>/<run_name>/` (same run name as in `runs/`).
-2. Copy **only** the small files: `run_config.json`, `*_metrics.json`, `plots/`.
-   Never copy `checkpoints/` (too large for git).
-3. Add one row to that model's `README.md` table (who, date, dataset, metrics, status).
-4. Plots used in the paper go to `paper/manuscript/fig/`.
+`MS-MGCA-Qwen3-VL/` dipakai langsung oleh `models/ms_mgca.py` dan `main.py --model ms-mgca`. Jangan dipindah atau diganti namanya.
+
+| Yang dicari | Lokasi |
+|---|---|
+| Hasil lengkap satu run (metrik, plot, config) | `runs/<model>/<run>/` |
+| Ringkasan semua model, hasil, dataset, dan catatan | [docs/MODEL_STATUS.md](../docs/MODEL_STATUS.md) |
+| Cara menjalankan | [docs/how_to_run.md](../docs/how_to_run.md) |

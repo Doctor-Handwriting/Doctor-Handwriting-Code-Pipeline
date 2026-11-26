@@ -381,9 +381,9 @@ def _split_key(record: Dict, rxhand_root: str) -> str:
 
 
 def _write_rxhand_split(cfg, train_pool: List[Dict], test_pool: List[Dict]) -> None:
-    """Split Train_Set into train/val (sorted by file, then shuffled with seed 42) and write the split files."""
+    """Split Train_Set into train/val (sorted by file, then shuffled with cfg.split_seed) and write the split files."""
     pool = sorted(train_pool, key=lambda r: _split_key(r, cfg.rxhand_root))
-    random.Random(42).shuffle(pool)
+    random.Random(cfg.split_seed).shuffle(pool)
     cut = int(len(pool) * cfg.train_split)
     splits = {"train": pool[:cut], "val": pool[cut:],
               "test": sorted(test_pool, key=lambda r: _split_key(r, cfg.rxhand_root))}
@@ -505,7 +505,7 @@ def parse_all_datasets(cfg) -> Tuple[List[Dict], List[Dict]]:
         all_records,
         train_split=cfg.train_split,
         val_split=cfg.val_split,
-        seed=42
+        seed=cfg.split_seed
     )
 
     return train_records, val_records

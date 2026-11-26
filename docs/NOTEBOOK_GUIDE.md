@@ -16,14 +16,16 @@ Sebelum commit, kosongkan output cell (`Kernel > Restart & Clear Output`) supaya
 
 ## 1. Hardware profile
 
-| Profil | Mesin | GPU | Qwen batch | Presisi | Gambar | YOLO batch |
-|---|---|---|---|---|---|---|
-| `laptop_3050ti` | Ryzen 7, 16GB RAM | RTX 3050 Ti 4GB | 1 × 8 | NF4 + fp16 | 512×512 | 32 |
-| `pc_3070ti` | Ryzen 5 3600, 32GB RAM | RTX 3070 Ti 8GB | 1 × 8 | NF4 + bf16 | 640×640 | 64 |
-| `pc_5070` | Ryzen 5 7500F, 32GB RAM | RTX 5070 12GB | 2 × 4 | NF4 + bf16 | 768×768 | 64 |
-| `pc_5070ti` | Ryzen 5 7500F, 32GB RAM | RTX 5070 Ti 16GB | 4 × 2 | NF4 + bf16 | 768×768 | 128 |
+Profil hanya mengatur memori: pembagian effective batch menjadi micro-batch × gradient accumulation, jumlah worker, dan gradient checkpointing. Presisi (bf16), kuantisasi (NF4 untuk semua ukuran Qwen), resolusi gambar (maks 512×512) dan semua hyperparameter sama di setiap mesin, dan diatur di blok `EXPERIMENT SETUP` di `main.py`.
 
-Semua profil memakai effective batch 8 untuk Qwen.
+| Profil | Mesin | GPU | Qwen-VL | MS-MGCA | YOLO |
+|---|---|---|---|---|---|
+| `laptop_3050ti` | Ryzen 7, 16GB RAM | RTX 3050 Ti 4GB | 1 × 8 | 1 × 8 | 32 × 2 |
+| `pc_3070ti` | Ryzen 5 3600, 32GB RAM | RTX 3070 Ti 8GB | 1 × 8 | 1 × 8 | 64 × 1 |
+| `pc_5070` | Ryzen 5 7500F, 32GB RAM | RTX 5070 12GB | 2 × 4 | 1 × 8 | 64 × 1 |
+| `pc_5070ti` | Ryzen 5 7500F, 32GB RAM | RTX 5070 Ti 16GB | 4 × 2 | 1 × 8 | 64 × 1 |
+
+Effective batch: 8 untuk Qwen-VL / MS-MGCA, 64 untuk YOLO, 10 untuk CRNN, di semua profil.
 
 Profil didefinisikan di `configs/config.py` (`HARDWARE_PROFILES`). Dengan `--profile auto`, profil dipilih dari VRAM GPU: ≥14GB `pc_5070ti`, ≥10GB `pc_5070`, ≥7GB `pc_3070ti`, selain itu `laptop_3050ti`.
 
@@ -97,8 +99,9 @@ Dataset/
 
 ### Cell 5: cek dataset
 ```python
-from configs.config import DatasetConfig
-missing = DatasetConfig(mode="combined").missing_paths()
+import main
+cfg = main.build_config(main.parse_args(["--dataset", "combined", "--stage", "augment"]))
+missing = cfg.dataset.missing_paths()
 print("OK" if not missing else missing)
 ```
 
@@ -118,13 +121,14 @@ PROFILE      = "auto"         # atau laptop_3050ti | pc_3070ti | pc_5070 | pc_50
 DATASET      = "rxhand"      # combined | dhp | rxhand
 SPLIT        = "--heldout-test"     # split standar tim (hanya untuk DATASET = "rxhand")
 AUGMENTATION = "online"      # online | offline
-EPOCHS       = 10
 ```
+
+Jumlah epoch tidak perlu diberikan: setiap model memakai resep di `EXPERIMENT SETUP` (`main.py`), misalnya Qwen-VL / MS-MGCA maks 3 epoch dengan early stopping. `--epochs N` mengganti nilai itu, tetapi run yang dibandingkan di paper harus memakai nilai yang sama.
 
 ### Qwen3-VL (`01_qwen_vl.ipynb`)
 ```python
 CKPT = "Qwen/Qwen3-VL-2B-Instruct"   # atau Qwen3-VL-4B-Instruct
-!python main.py --stage train --model qwen-vl --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION} --epochs {EPOCHS}
+!python main.py --stage train --model qwen-vl --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION}
 !python main.py --stage infer --model qwen-vl --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION}
 ```
 
@@ -133,7 +137,7 @@ Satu eksperimen:
 ```python
 EXP = "e2_multiscale"   # e1_baseline ... e6_full_model
 CKPT = "Qwen/Qwen3-VL-2B-Instruct"
-!python main.py --stage train --model ms-mgca --experiment {EXP} --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION} --epochs {EPOCHS}
+!python main.py --stage train --model ms-mgca --experiment {EXP} --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION}
 !python main.py --stage calibrate --model ms-mgca --experiment {EXP} --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION}
 !python main.py --stage infer --model ms-mgca --experiment {EXP} --checkpoint {CKPT} --profile {PROFILE} --dataset {DATASET} {SPLIT} --augmentation {AUGMENTATION}
 ```

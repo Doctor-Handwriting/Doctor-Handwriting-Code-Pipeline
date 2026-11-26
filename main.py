@@ -24,7 +24,10 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from configs.config import AugmentationConfig, PipelineConfig, ModelConfig, DatasetConfig, HARDWARE_PROFILES
+from configs.config import (
+    AugmentationConfig, CRNNConfig, DatasetConfig, EvaluationConfig, HARDWARE_PROFILES, LoRAConfig, MODEL_TYPES,
+    MSMGCASetup, ModelConfig, PipelineConfig, QuantizationConfig, TrainingConfig, YOLOConfig, yolo26_size,
+)
 from models.models import (
     CRNNProcessor, YOLOProcessor, build_charset, build_class_list, load_crnn, load_qwen_vl,
     load_yolo_classifier, save_crnn, save_yolo,
@@ -54,21 +57,23 @@ logger = logging.getLogger(__name__)
 #   "train"     -> fine-tune / train the model
 #   "calibrate" -> MS-MGCA E4/E6 only: fit the confidence head on the model's real right/wrong transcriptions of held-out
 #                  validation images (run after "train", before "infer")
-#   "infer"     -> evaluate the latest trained run on the validation set
-# Every constant below can also be given on the command line (python main.py --help), which overrides it.
+#   "infer"     -> evaluate the latest trained run on the held-out test set (the validation set when there is none)
+# =====================================================================================================================
+# RUN SELECTION - what to run. The constants below can also be given on the command line (python main.py --help).
+# The hyperparameters of every model are in the EXPERIMENT SETUP block further down.
+# =====================================================================================================================
 STAGE = "train"  # Options: "augment", "train", "calibrate", "infer"
 # Model to train / run inference with (no need to touch models.py or config.py):
-#   "qwen-vl" -> Qwen-VL fine-tuned with LoRA/QLoRA; the checkpoint is QWEN_CHECKPOINT below
+#   "qwen-vl" -> Qwen-VL fine-tuned with QLoRA; the checkpoint is QWEN_CHECKPOINT below
 #   "crnn"    -> CRNN from the paper (13 VGG16 conv + 3 BiLSTM + CTC), trained from scratch with the
-#                paper's recipe (lr 5e-4, batch 10, early stopping); architecture settings: CRNNConfig
+#                paper's recipe (CRNN_TRAINING / CRNN_ARCHITECTURE below)
 #   "yolo"    -> Ultralytics YOLO *classification* net (YOLO_CHECKPOINT, a "-cls" model) used as a
 #                closed-vocabulary word recognizer: each distinct training label is a class and the
 #                predicted class is the transcription. It can never output a word absent from the
 #                training labels (~21% of validation words on the current split, so exact match tops
-#                out near 79%); settings: YOLOConfig. For free-form text use "qwen-vl" or "crnn".
+#                out near 79%); settings: YOLO_TRAINING below. For free-form text use "qwen-vl" or "crnn".
 #   "yolo26"  -> the same word classifier on the newer YOLO26 classification backbones (YOLO26_CHECKPOINT,
-#                sizes n/s/m/l/x); per-size batch/accumulation for each hardware profile and per-size
-#                learning rate: YOLO26Config + HardwareProfile.yolo26_micro_batch. Same closed-vocabulary
+#                sizes n/s/m/l/x); per-size learning rate: YOLO26_LEARNING_RATE below. Same closed-vocabulary
 #                ceiling as "yolo".
 #   "ms-mgca" -> MS-MGCA-Qwen3-VL (experiments/MS-MGCA-Qwen3-VL): Qwen3-VL + LoRA with multi-scale gated fusion,
 #                medication-guided cross-attention and an uncertainty-aware confidence head. The ablation (E1-E6) is
@@ -78,10 +83,9 @@ STAGE = "train"  # Options: "augment", "train", "calibrate", "infer"
 MODEL_CHOICE = "ms-mgca"  # Options: "qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"
 # Used when MODEL_CHOICE == "qwen-vl". Any Qwen2.5-VL / Qwen3-VL checkpoint, e.g.
 #   "Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct"
-# (8B needs a 12GB+ profile and trains as 4-bit QLoRA; 2B/4B train in plain bf16 on pc_5070ti;
-#  use a 2B/3B model on the 4GB laptop).
+# Every size trains as 4-bit QLoRA (QUANTIZATION below). 8B needs a 12GB+ profile; use 2B on the 4GB laptop.
 QWEN_CHECKPOINT = "Qwen/Qwen3-VL-8B-Instruct"
-# Used when MODEL_CHOICE == "ms-mgca": which ablation of experiments/MS-MGCA-Qwen3-VL/configs/ to run
+# Used when MODEL_CHOICE == "ms-mgca": which ablation of MSMGCA_ABLATIONS (below) to run
 #   "e1_baseline"             Qwen3-VL + LoRA only (reference)
 #   "e2_multiscale"           + multi-scale gated fusion (Component A)
 #   "e3_cross_attention"      + medication-guided cross-attention (Component B)
@@ -91,7 +95,7 @@ QWEN_CHECKPOINT = "Qwen/Qwen3-VL-8B-Instruct"
 # All components train jointly with LoRA. Each experiment/backbone gets its own run folder
 # (run_<time>_<profile>_<experiment>_<size>...), and STAGE = "infer" evaluates the latest run of the chosen one.
 MSMGCA_EXPERIMENT = "e6_full_model"
-# Number of learnable medication queries K of the cross-attention (E3, E5, E6). None = the experiment YAML's value (4);
+# Number of learnable medication queries K of the cross-attention (E3, E5, E6). None = MSMGCA_CROSS_ATTENTION's value (4);
 # set 1, 4 or 8 for the K sweep (the run folder then ends in _k<K>).
 MSMGCA_NUM_QUERIES = None
 # Used when MODEL_CHOICE == "yolo": must be a classification model, one of
@@ -101,12 +105,14 @@ YOLO_CHECKPOINT = "yolov8m-cls.pt"
 #   yolo26n-cls.pt (3.6M params) | yolo26s-cls.pt (7.5M) | yolo26m-cls.pt (12.4M) | yolo26l-cls.pt (14.9M) | yolo26x-cls.pt (30.4M)
 # (all five fit every hardware profile; weights are downloaded on first use).
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"
+# The profile only decides memory settings: how the fixed effective batch is split into micro-batch x gradient
+# accumulation, data-loader workers and gradient checkpointing. The experiment is identical on every machine.
 # Options: "auto"         -> pick by detected GPU VRAM
-#          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (4-bit + LoRA, fp16, batch 1x8)
-#          "pc_3070ti"     -> RTX 3070 Ti 8GB / 32GB RAM (Qwen 2B/4B QLoRA, bf16 compute, batch 1x8)
-#          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B QLoRA, bf16 compute, batch 2x4)
-#          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (8B QLoRA batch 4x2; Qwen 2B/4B in plain bf16)
-# Profiles are defined in configs/config.py (HARDWARE_PROFILES).
+#          "laptop_3050ti" -> RTX 3050 Ti 4GB / 16GB RAM (Qwen-VL micro-batch 1 x 8 accumulation)
+#          "pc_3070ti"     -> RTX 3070 Ti 8GB / 32GB RAM (Qwen 2B/4B, micro-batch 1 x 8)
+#          "pc_5070"       -> RTX 5070 12GB / 32GB RAM (Qwen3-VL-8B, micro-batch 2 x 4)
+#          "pc_5070ti"     -> RTX 5070 Ti 16GB / 32GB RAM (Qwen3-VL-8B, micro-batch 4 x 2)
+# (MS-MGCA always runs micro-batch 1 x 8.) Profiles are defined in configs/config.py (HARDWARE_PROFILES).
 HARDWARE_PROFILE = "pc_5070"
 # Which data to train and validate on:
 #   "combined" -> DHP + RxHand merged into one pool, then a single train/val split (default)
@@ -128,9 +134,206 @@ RXHAND_HELDOUT_TEST = True
 #                brightnesscontrast, rotate, shiftscalerotate, mixed + augmentation_manifest.json);
 #                STAGE = "train"/"infer" then read from there with no augmentation at train time. Only training
 #                images get variants (the split is made on the originals), validation uses originals.
-#                Training epochs get ~8x larger, so lower num_epochs accordingly. Offline runs get "_offline"
-#                in their run folder name.
+#                Training epochs get ~8x larger (VLM_TRAINING's 3 epochs already account for it). Offline runs get
+#                "_offline" in their run folder name.
 AUGMENTATION_MODE = "offline"
+
+
+# =====================================================================================================================
+# EXPERIMENT SETUP - fixed for the paper
+# =====================================================================================================================
+# Every value that changes a result is set here and nowhere else (configs/config.py only holds the types and the
+# memory-only hardware profiles). The resolved setup of each run is written to <run>/run_config.json, and --resume
+# refuses to continue a run whose setup differs from it.
+#
+# References cited below as [n]:
+#  [1] Dettmers, Pagnoni, Holtzman, Zettlemoyer. "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS 2023.
+#      Sec. 4, App. A.1, App. B.2, Table 9.
+#  [2] Malladi, Lyu, Panigrahi, Arora. "On the SDEs and Scaling Rules for Adaptive Gradient Algorithms."
+#      NeurIPS 2022. Square-root scaling rule for Adam: lr proportional to sqrt(batch size).
+#  [3] Liu, Li, Li, Lee. "Improved Baselines with Visual Instruction Tuning" (LLaVA-1.5). CVPR 2024. Table 9.
+#  [4] Wortsman et al. "Small-scale proxies for large-scale Transformer training instabilities." ICLR 2024.
+#  [5] Huttner, Mayr, Gorges, Wu et al. "Low-Rank Adaptation vs. Fine-Tuning for Handwritten Text Recognition."
+#      (paper/references/)
+#  [6] Chung, Choi. "Finetuning Vision-Language Models as OCR Systems for Low-Resource Languages: A Case Study of
+#      Manchu." arXiv:2507.06761, 2025. Qwen2.5-VL + LoRA r=64 for word-level OCR.
+#  [7] Dettmers, Lewis, Shleifer, Zettlemoyer. "8-bit Optimizers via Block-wise Quantization." ICLR 2022.
+#  [8] Prechelt. "Early Stopping - But When?" Neural Networks: Tricks of the Trade, Springer 1998.
+#  [9] Achkar et al. "Medical Handwritten Prescription Recognition Using CRNN." 2019 (CRNN baseline recipe).
+
+SEED = 3407  # training seed: model init, data order, dropout (also used by [6])
+
+# --- Data split -------------------------------------------------------------------------------------------------------
+SPLIT_SEED = 42        # do not change: configs/splits/rxhand/*.csv (held-out split) were written with it
+TRAIN_FRACTION = 0.80  # train / val fractions of the training pool (RxHand held-out: of Train_Set)
+VAL_FRACTION = 0.20
+MAX_SAMPLES = None     # debug only: limit the dataset to N images (None = all)
+
+# --- Input and decoding -----------------------------------------------------------------------------------------------
+# Pixel budget per image (larger images are downscaled). The RxHand crops are 128x128 and never reach it; it only
+# affects DHP (median ~600k px). 512x512 fits every hardware profile.
+MAX_PIXELS = 512 * 512
+MAX_NEW_TOKENS = 64
+
+# --- Qwen-VL and MS-MGCA: QLoRA [1] -----------------------------------------------------------------------------------
+QUANTIZATION = dict(
+    load_in_4bit=True,                    # NF4 + double quantization + bf16 compute, every backbone size [1, App. B.2]
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    quantize_vision=False,                # vision tower stays bf16 (fine handwriting strokes)
+    upcast_fp32=False,                    # embeddings / lm_head stay bf16
+)
+LORA = dict(
+    # r=64, alpha=16 [1, App. B.2]; r=64 is also where handwriting gains saturate [5] and the rank used for VLM OCR
+    # in [6]. alpha/r = 0.25 is the update scale the learning rate below is tuned for.
+    r=64,
+    lora_alpha=16,
+    lora_dropout=0.1,                     # [1, App. B.2]: 0.1 for models up to 13B
+    bias="none",
+    # Every linear layer of the language model: "LoRA on all linear transformer block layers are required to match
+    # full finetuning performance" [1, Sec. 4]. Same targets for qwen-vl and every MS-MGCA ablation.
+    target_modules=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+)
+
+# --- Training recipes (one per model family) --------------------------------------------------------------------------
+COMMON_TRAINING = dict(
+    seed=SEED,
+    allow_tf32=True,                      # TF32 matmuls for fp32 ops; every profile GPU is Ampere or newer
+    logging_steps=10,
+    # Checkpoint selection and early stopping on validation CER [8]. Not eval_loss: val loss kept rising (the model
+    # grows overconfident on the words it gets wrong) while val CER and exact match still improved.
+    metric_for_best_model="eval_cer",
+    greater_is_better=False,
+    load_best_model_at_end=True,
+    save_total_limit=3,                   # the best checkpoint is always kept on top of the newest ones
+)
+VLM_TRAINING = dict(                      # qwen-vl and every MS-MGCA ablation
+    effective_batch_size=8,
+    # Peak LR: [1, Table 9] trains 7B/13B at 2e-4 with batch 16; the square-root rule [2] gives
+    # 2e-4 * sqrt(8/16) = 1.4e-4 for batch 8. (The earlier 2e-4 with alpha/r = 2 took ~8x larger LoRA steps than [1]
+    # and diverged at peak LR in the E6 8B run.)
+    learning_rate=1.4e-4,
+    warmup_steps=0.10,                    # 10% of the steps; longer warmup lowers LR sensitivity [4]
+    lr_scheduler_type="cosine",           # cosine decay after warmup, as in [3] and [6]
+    weight_decay=0.01,
+    optim="adamw_bnb_8bit",               # 8-bit AdamW [7]; also used for the MS-MGCA module groups
+    max_grad_norm=0.3,                    # [1, App. B.2]
+    precision="bf16",
+    # Offline augmentation shows every original ~8 times per epoch (original + 7 variants): 3 epochs at most, early
+    # stopping ends the run earlier once val CER stops improving.
+    num_epochs=3,
+    eval_strategy="steps",                # full val set decoded at every evaluation
+    eval_steps=500,
+    save_steps=500,
+    early_stopping_patience=4,            # 4 evaluations = 2000 steps without a better val CER
+)
+CRNN_TRAINING = dict(                     # paper recipe [9]
+    effective_batch_size=10,
+    learning_rate=5e-4,
+    warmup_steps=0,
+    lr_scheduler_type="constant",
+    weight_decay=0.0,
+    optim="adamw_torch",
+    max_grad_norm=1.0,
+    precision="fp32",                     # trained from scratch in fp32
+    num_epochs=300,                       # upper bound; [9] stopped early after ~200
+    eval_strategy="epoch",
+    eval_steps=None,
+    save_steps=None,
+    early_stopping_patience=20,           # [9]: 20 epochs without improvement
+)
+YOLO_TRAINING = dict(                     # yolo and yolo26 word classifiers (ImageNet-pretrained, fine-tuned)
+    effective_batch_size=64,
+    learning_rate=1e-3,                   # yolo26: replaced by YOLO26_LEARNING_RATE for the chosen size
+    warmup_steps=100,
+    lr_scheduler_type="cosine",
+    weight_decay=0.01,
+    optim="adamw_torch",
+    max_grad_norm=1.0,
+    precision="bf16",
+    num_epochs=50,
+    eval_strategy="epoch",
+    eval_steps=None,
+    save_steps=None,
+    early_stopping_patience=10,           # epochs
+)
+# Peak LR per YOLO26 size: lower for the deeper/wider l and x (heuristic, not tuned on this dataset).
+YOLO26_LEARNING_RATE = {"n": 1e-3, "s": 1e-3, "m": 1e-3, "l": 5e-4, "x": 5e-4}
+TRAINING_RECIPES = {"qwen-vl": VLM_TRAINING, "ms-mgca": VLM_TRAINING, "crnn": CRNN_TRAINING,
+                    "yolo": YOLO_TRAINING, "yolo26": YOLO_TRAINING}
+
+# --- Baseline architectures -------------------------------------------------------------------------------------------
+CRNN_ARCHITECTURE = dict(
+    img_height=64, img_width=340,         # [9]: 340x60 crops, aspect-preserving resize + white padding
+    lstm_hidden=256, lstm_layers=3,
+    batch_norm=True,                      # not in [9]; makes a from-scratch VGG16 + CTC stack train reliably
+)
+YOLO_ARCHITECTURE = dict(imgsz=224, label_smoothing=0.1)
+
+# --- MS-MGCA-Qwen3-VL -------------------------------------------------------------------------------------------------
+# Ablation -> (A: multi-scale gated fusion, B: medication cross-attention, D: confidence head). All components train
+# jointly with LoRA; every ablation uses exactly the same backbone, LoRA, recipe and seed.
+MSMGCA_ABLATIONS = {
+    "e1_baseline":             (False, False, False),
+    "e2_multiscale":           (True,  False, False),
+    "e3_cross_attention":      (False, True,  False),
+    "e4_confidence":           (False, False, True),
+    "e5_multiscale_crossattn": (True,  True,  False),
+    "e6_full_model":           (True,  True,  True),
+}
+# Learning rate of the randomly initialised modules (A, B and D): the from-scratch vision-language connector of [3]
+# trains at 1e-3 with batch 256 (Table 9); the square-root rule [2] gives 1e-3 * sqrt(8/256) = 1.8e-4 for batch 8.
+MSMGCA_MODULE_LR = 1.8e-4
+MSMGCA_CONFIDENCE_LR = 1.8e-4
+MSMGCA_MULTISCALE = dict(            # Component A
+    crop_size=224,                   # local crop resolution
+    grid_size=2,                     # 2x2 grid = 4 crops
+    overlap_ratio=0.15,              # overlap between neighbouring crops
+    reduction_method="spatial_pool",
+    fusion_method="gated",
+)
+MSMGCA_CROSS_ATTENTION = dict(       # Component B
+    num_queries=4,                   # K learnable medication queries (sweep 1 / 4 / 8 with MSMGCA_NUM_QUERIES)
+    num_heads=8,
+    dropout=0.1,
+    integration_mode="adapter",      # residual modulation of the visual tokens
+)
+MSMGCA_UNCERTAINTY = dict(           # Component D
+    head_type="mlp",
+    pooling_method="mean",
+    confidence_threshold=0.70,       # tau: predictions below it are flagged for review
+    loss_weight=0.5,                 # lambda_c in L_total = L_text + lambda_c * L_conf
+)
+
+# --- Evaluation and confidence calibration ----------------------------------------------------------------------------
+EVALUATION = dict(
+    train_eval_samples=None,         # val images decoded at every training evaluation (None = all)
+    infer_samples=None,              # images scored by calibrate / infer (None = all; --samples overrides)
+    max_new_tokens=MAX_NEW_TOKENS,
+    calibration_fraction=0.5,        # val set: half fits the confidence head, half evaluates it
+    calibration_steps=300,           # AdamW steps on the cached features (no VLM forward)
+    calibration_lr=1e-3,
+    calibration_weight_decay=0.01,
+    calibration_batch_size=64,
+    calibration_val_fraction=0.2,    # of the calibration half, kept aside to pick the best step
+    calibration_seed=SEED,
+)
+
+# --- Augmentation -----------------------------------------------------------------------------------------------------
+# Offline variants are generated once by STAGE = "augment"; changing a value here requires running it again.
+AUGMENTATION = dict(
+    enable_augmentation=True,
+    offline_include_mixed=True,      # also one variant with all six transforms applied together
+    offline_seed=42,
+    motion_blur_prob=0.3,            # online mode: probability of each transform per image
+    elastic_deform_prob=0.3,
+    perspective_prob=0.2,
+    brightness_contrast_prob=0.5,
+    rotation_limit=15,               # degrees
+    shift_limit=0.1,
+    scale_limit=0.2,
+)
 
 
 def build_messages(prompt: str, response: str = None) -> List[Dict]:
@@ -445,9 +648,16 @@ class MSMGCATrainer(GenerationEvalTrainer):
 
     def create_optimizer(self, model=None):
         if self.optimizer is None:
-            self.optimizer = torch.optim.AdamW(
-                ms_mgca_param_groups(self.model, self.args.learning_rate),
-                weight_decay=self.args.weight_decay)
+            groups = ms_mgca_param_groups(self.model, self.args.learning_rate)
+            optim = getattr(self.args.optim, "value", self.args.optim)
+            if optim == "adamw_bnb_8bit":
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(groups, weight_decay=self.args.weight_decay)
+            elif optim in ("adamw_torch", "adamw_torch_fused"):
+                self.optimizer = torch.optim.AdamW(groups, weight_decay=self.args.weight_decay)
+            else:
+                raise ValueError(f"MS-MGCA builds its optimizer per component; optim '{optim}' is not supported "
+                                 f"(use adamw_bnb_8bit or adamw_torch).")
         return self.optimizer
 
 
@@ -661,6 +871,37 @@ def stage_output_exists(cfg: PipelineConfig) -> bool:
     return False
 
 
+# run_config.json sections compared by --resume, and the keys in them that only describe the machine.
+SETUP_SECTIONS = ("quantization", "lora", "training", "dataset", "augmentation", "model", "ms_mgca", "crnn", "yolo",
+                  "evaluation")
+MACHINE_KEYS = {"num_workers", "pin_memory", "gradient_checkpointing", "adapter_path", "infer_samples", "offline_root",
+                "dataset_root", "rxhand_split_dir", "dhp_root", "dhp_labels", "dhp_images", "rxhand_root",
+                "rxhand_train_labels", "rxhand_test_labels", "rxhand_train_images", "rxhand_test_images"}
+
+
+def run_config_dict(cfg: PipelineConfig) -> Dict:
+    """The resolved setup as written to run_config.json (JSON types only: tuples -> lists, dtypes -> str)."""
+    return json.loads(json.dumps({"model_name": cfg.model_name, **asdict(cfg)}, default=str))
+
+
+def setup_differences(original: Dict, current: Dict) -> List[str]:
+    """'section.key: original -> current' for every setup value that differs (machine-only keys ignored)."""
+    def flatten(d, prefix=""):
+        out = {}
+        for k, v in (d or {}).items():
+            out.update(flatten(v, f"{prefix}{k}.") if isinstance(v, dict) else {f"{prefix}{k}": v})
+        return out
+
+    missing = "<not set>"
+    changed = []
+    for section in SETUP_SECTIONS:
+        was, now = flatten(original.get(section)), flatten(current.get(section))
+        for key in sorted(set(was) | set(now)):
+            if key.split(".")[-1] not in MACHINE_KEYS and was.get(key, missing) != now.get(key, missing):
+                changed.append(f"{section}.{key}: {was.get(key, missing)} -> {now.get(key, missing)}")
+    return changed
+
+
 def train_stage(cfg: PipelineConfig) -> None:
     """Stage 2: Train Vision-Language Model with LoRA."""
     logger.info("=" * 60)
@@ -672,17 +913,18 @@ def train_stage(cfg: PipelineConfig) -> None:
     config_path = os.path.join(cfg.run_dir, "run_config.json")
     resume_from = latest_checkpoint(cfg.checkpoint_dir) if cfg.resume else None
     if resume_from and os.path.isfile(config_path):
-        # The learning-rate schedule is laid out for the original number of steps; a different length would
-        # silently bend it, so a resumed run must use the original settings. The original run_config.json is kept.
+        # A resumed run must continue with exactly the setup it started with (the LR schedule is laid out for the
+        # original number of steps, and the optimizer state belongs to the original recipe). The original
+        # run_config.json is kept.
         with open(config_path, encoding="utf-8") as f:
             original = json.load(f)
-        was = original.get("training", {}).get("num_epochs")
-        if was is not None and was != cfg.training.num_epochs:
-            raise ValueError(f"This run was started with {was} epochs but --resume is using {cfg.training.num_epochs}. "
-                             f"Resume with the original settings (--epochs {was}).")
+        changed = setup_differences(original, run_config_dict(cfg))
+        if changed:
+            raise ValueError("--resume: this run was started with a different setup:\n  " + "\n  ".join(changed)
+                             + "\nResume with the original EXPERIMENT SETUP values (e.g. --epochs), or start a new run.")
     else:
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump({"model_name": cfg.model_name, **asdict(cfg)}, f, indent=2, default=str)
+            json.dump(run_config_dict(cfg), f, indent=2)
     mem_profiler = MemoryProfiler()
     mem_profiler.start()
 
@@ -734,40 +976,38 @@ def train_stage(cfg: PipelineConfig) -> None:
     gen_eval_records = val_records[:n_gen] if n_gen else val_records
     logger.info(f"Generation metrics (WER/CER/accuracy) computed on {len(gen_eval_records)} val samples per eval")
 
+    t = cfg.training
+    step_schedule = {} if t.eval_by_epoch else {"eval_steps": t.eval_steps, "save_steps": t.save_steps}
     training_args = TrainingArguments(
         output_dir=cfg.checkpoint_dir,
-        per_device_train_batch_size=cfg.training.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.training.per_device_eval_batch_size,
-        num_train_epochs=cfg.training.num_epochs,
-        learning_rate=cfg.training.learning_rate,
-        warmup_steps=cfg.training.warmup_steps,
-        weight_decay=cfg.training.weight_decay,
-        optim=cfg.training.optim,
-        lr_scheduler_type=cfg.training.lr_scheduler_type,
-        lr_scheduler_kwargs={"num_cycles": cfg.training.lr_scheduler_num_cycles}
-        if cfg.training.lr_scheduler_type == "cosine_with_restarts" else {},
-        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
-        logging_steps=cfg.log_steps,
-        eval_strategy="epoch" if cfg.eval_by_epoch else "steps",
-        eval_steps=cfg.eval_steps,
-        save_steps=cfg.save_steps,
-        save_strategy="epoch" if cfg.eval_by_epoch else "steps",
-        save_total_limit=cfg.training.save_total_limit,
-        load_best_model_at_end=cfg.training.load_best_model_at_end,
-        # Val CER from the generation eval, not eval_loss (see TrainingConfig.metric_for_best_model).
-        metric_for_best_model=cfg.training.metric_for_best_model,
-        greater_is_better=cfg.training.greater_is_better,
-        fp16=cfg.training.use_fp16,
-        bf16=cfg.training.use_bf16,
-        dataloader_num_workers=cfg.training.num_workers,
-        dataloader_pin_memory=cfg.training.pin_memory,
+        per_device_train_batch_size=t.per_device_train_batch_size,
+        per_device_eval_batch_size=t.per_device_eval_batch_size,
+        gradient_accumulation_steps=t.gradient_accumulation_steps,
+        num_train_epochs=t.num_epochs,
+        learning_rate=t.learning_rate,
+        warmup_steps=t.warmup_steps,  # int = steps, float in [0, 1) = fraction of the total steps
+        weight_decay=t.weight_decay,
+        optim=t.optim,
+        lr_scheduler_type=t.lr_scheduler_type,
+        logging_steps=t.logging_steps,
+        eval_strategy=t.eval_strategy,
+        save_strategy=t.eval_strategy,
+        **step_schedule,
+        save_total_limit=t.save_total_limit,
+        load_best_model_at_end=t.load_best_model_at_end,
+        metric_for_best_model=t.metric_for_best_model,
+        greater_is_better=t.greater_is_better,
+        fp16=t.use_fp16,
+        bf16=t.use_bf16,
+        dataloader_num_workers=t.num_workers,
+        dataloader_pin_memory=t.pin_memory,
         # Windows spawns workers slowly (~6s each); keep them alive across epochs/evals.
-        dataloader_persistent_workers=cfg.training.num_workers > 0,
+        dataloader_persistent_workers=t.num_workers > 0,
         # MS-MGCA enables checkpointing on its backbone inside the loader (its wrapper has no such method for the Trainer).
-        gradient_checkpointing=cfg.training.gradient_checkpointing and not cfg.is_ms_mgca,
+        gradient_checkpointing=cfg.model.gradient_checkpointing and not cfg.is_ms_mgca,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        max_grad_norm=cfg.training.max_grad_norm,
-        seed=cfg.training.seed,
+        max_grad_norm=t.max_grad_norm,
+        seed=t.seed,
         remove_unused_columns=False,
         report_to="none",  # TensorBoard is attached explicitly below
         disable_tqdm=False,
@@ -794,13 +1034,10 @@ def train_stage(cfg: PipelineConfig) -> None:
         # Keep the logged history up to the checkpoint; the steps after it are about to be trained again.
         plot_callback.history = [e for e in (load_history(cfg.run_dir) or []) if e.get("step", 0) <= resume_from[1]]
     trainer.add_callback(plot_callback)
-    # Patience counts evaluations without a better metric_for_best_model (val CER). CRNN / YOLO evaluate once per
-    # epoch, so theirs is in epochs (CRNN: 20 as in the paper); Qwen-VL / MS-MGCA evaluate every eval_steps.
-    patience = (cfg.crnn.early_stopping_patience if cfg.model_type == "crnn"
-                else cfg.yolo_settings.early_stopping_patience if cfg.is_yolo
-                else cfg.training.early_stopping_patience)
-    if patience > 0:
-        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=patience))
+    # Patience counts evaluations without a better metric_for_best_model (val CER): epochs for CRNN / YOLO,
+    # eval_steps intervals for Qwen-VL / MS-MGCA (see the recipes in the EXPERIMENT SETUP block).
+    if t.early_stopping_patience > 0:
+        trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=t.early_stopping_patience))
 
     if resume_from:
         logger.info(f"RESUMING from {resume_from[0]} (step {resume_from[1]}) in {cfg.run_dir}")
@@ -892,7 +1129,8 @@ def calibrate_stage(cfg: PipelineConfig) -> None:
 
     before = evaluate()
     fit = fit_confidence_head(model, x_cal, z_cal, steps=ev.calibration_steps, lr=ev.calibration_lr,
-                              seed=ev.calibration_seed)
+                              weight_decay=ev.calibration_weight_decay, batch_size=ev.calibration_batch_size,
+                              val_fraction=ev.calibration_val_fraction, seed=ev.calibration_seed)
     after = evaluate() if fit else before
 
     for name, rep in (("BEFORE calibration (jointly trained head)", before), ("AFTER calibration", after)):
@@ -1032,10 +1270,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Doctor-handwriting VLM pipeline. Every option overrides the constant of the same name "
                     "at the top of main.py.")
     p.add_argument("--stage", choices=["augment", "train", "calibrate", "infer"], help=f"STAGE (default {STAGE})")
-    p.add_argument("--model", choices=["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"],
-                   help=f"MODEL_CHOICE (default {MODEL_CHOICE})")
+    p.add_argument("--model", choices=MODEL_TYPES, help=f"MODEL_CHOICE (default {MODEL_CHOICE})")
     p.add_argument("--checkpoint", help=f"QWEN_CHECKPOINT (default {QWEN_CHECKPOINT})")
-    p.add_argument("--experiment", help=f"MSMGCA_EXPERIMENT, e1_baseline ... e6_full_model (default {MSMGCA_EXPERIMENT})")
+    p.add_argument("--experiment", choices=list(MSMGCA_ABLATIONS),
+                   help=f"MSMGCA_EXPERIMENT (default {MSMGCA_EXPERIMENT})")
     p.add_argument("--queries", type=int, help=f"MSMGCA_NUM_QUERIES, K = 1, 4 or 8 (default {MSMGCA_NUM_QUERIES})")
     p.add_argument("--profile", help=f"HARDWARE_PROFILE (default {HARDWARE_PROFILE})")
     p.add_argument("--dataset", choices=["combined", "dhp", "rxhand"], help=f"DATASET_MODE (default {DATASET_MODE})")
@@ -1046,37 +1284,86 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help=f"RXHAND_HELDOUT_TEST = True (default {RXHAND_HELDOUT_TEST})")
     p.add_argument("--resume", action="store_true",
                    help="MS-MGCA: continue an interrupted run. train picks up the newest run of this exact setting "
-                        "(model, experiment, backbone, K, dataset, augmentation) from its latest checkpoint, with the "
-                        "original --epochs; a stage whose output already exists (finished training, calibrated "
-                        "checkpoint, inference results) is skipped")
-    p.add_argument("--epochs", type=int, help="number of training epochs (default: the hardware profile's)")
-    p.add_argument("--samples", type=int, help="limit the validation images used by calibrate/infer (default: all)")
+                        "(model, experiment, backbone, K, dataset, augmentation) from its latest checkpoint, and only "
+                        "when the EXPERIMENT SETUP (incl. --epochs) is the one it started with; a stage whose output "
+                        "already exists (finished training, calibrated checkpoint, inference results) is skipped")
+    p.add_argument("--epochs", type=int, help="number of training epochs (default: num_epochs of the model's recipe)")
+    p.add_argument("--samples", type=int, help="limit the images used by calibrate/infer (default: all)")
     return p.parse_args(argv)
+
+
+def build_config(args: argparse.Namespace) -> PipelineConfig:
+    """PipelineConfig from the RUN SELECTION constants (or their command-line overrides) and the EXPERIMENT SETUP
+    block. This is the only place values enter the configuration; the hardware profile then only splits the
+    effective batch into micro-batch x accumulation and sets the data-loader workers."""
+    pick = lambda cli, constant: constant if cli is None else cli
+    model_type = pick(args.model, MODEL_CHOICE)
+    dataset_mode = pick(args.dataset, DATASET_MODE)
+    is_rxhand = dataset_mode == "rxhand"  # the RxHand split options only apply to RxHand-only runs
+
+    recipe = {**COMMON_TRAINING, **TRAINING_RECIPES[model_type]}
+    if model_type == "yolo26":
+        recipe["learning_rate"] = YOLO26_LEARNING_RATE[yolo26_size(YOLO26_CHECKPOINT)]
+    if args.epochs:
+        recipe["num_epochs"] = args.epochs
+    evaluation = dict(EVALUATION)
+    if args.samples:
+        evaluation["infer_samples"] = args.samples
+
+    return PipelineConfig(
+        stage=pick(args.stage, STAGE),
+        resume=args.resume,
+        model_type=model_type,
+        hardware_profile=pick(args.profile, HARDWARE_PROFILE),
+        quantization=QuantizationConfig(**QUANTIZATION),
+        lora=LoRAConfig(**LORA),
+        training=TrainingConfig(**recipe),
+        dataset=DatasetConfig(mode=dataset_mode,
+                              rxhand_official_split=is_rxhand and pick(args.official_split, RXHAND_OFFICIAL_SPLIT),
+                              rxhand_heldout_test=is_rxhand and pick(args.heldout_test, RXHAND_HELDOUT_TEST),
+                              train_split=TRAIN_FRACTION, val_split=VAL_FRACTION, split_seed=SPLIT_SEED,
+                              max_samples=MAX_SAMPLES),
+        augmentation=AugmentationConfig(mode=pick(args.augmentation, AUGMENTATION_MODE), **AUGMENTATION),
+        model=ModelConfig(model_type=model_type, qwen_checkpoint=pick(args.checkpoint, QWEN_CHECKPOINT),
+                          ms_mgca_experiment=pick(args.experiment, MSMGCA_EXPERIMENT),
+                          ms_mgca_num_queries=pick(args.queries, MSMGCA_NUM_QUERIES),
+                          yolo_checkpoint=YOLO_CHECKPOINT, yolo26_checkpoint=YOLO26_CHECKPOINT,
+                          max_pixels=MAX_PIXELS),
+        ms_mgca=MSMGCASetup(ablations=MSMGCA_ABLATIONS, module_learning_rate=MSMGCA_MODULE_LR,
+                            confidence_learning_rate=MSMGCA_CONFIDENCE_LR, multiscale=MSMGCA_MULTISCALE,
+                            cross_attention=MSMGCA_CROSS_ATTENTION, uncertainty=MSMGCA_UNCERTAINTY),
+        crnn=CRNNConfig(**CRNN_ARCHITECTURE),
+        yolo=YOLOConfig(**YOLO_ARCHITECTURE),
+        evaluation=EvaluationConfig(**evaluation),
+    )
+
+
+def log_setup(cfg: PipelineConfig) -> None:
+    """The setup values that matter for this model, so the log shows what actually runs."""
+    t = cfg.training
+    logger.info(f"Recipe: {t.num_epochs} epochs, lr {t.learning_rate:g} ({t.lr_scheduler_type}, warmup {t.warmup_steps}), "
+                f"effective batch {t.effective_batch_size} = {t.per_device_train_batch_size} x "
+                f"{t.gradient_accumulation_steps} accum, optim {t.optim}, wd {t.weight_decay:g}, "
+                f"clip {t.max_grad_norm:g}, {t.precision}, seed {t.seed}")
+    logger.info(f"Selection: {t.metric_for_best_model} ({'max' if t.greater_is_better else 'min'}), "
+                f"early stopping after {t.early_stopping_patience} evals without improvement "
+                f"(every {t.eval_steps} steps)" if not t.eval_by_epoch else
+                f"Selection: {t.metric_for_best_model}, early stopping after {t.early_stopping_patience} epochs")
+    if cfg.is_vlm:
+        q, l = cfg.quantization, cfg.lora
+        logger.info(f"QLoRA: 4-bit {q.load_in_4bit} ({q.bnb_4bit_quant_type}, double quant "
+                    f"{q.bnb_4bit_use_double_quant}), LoRA r={l.r} alpha={l.lora_alpha} dropout={l.lora_dropout} "
+                    f"on {', '.join(l.target_modules)}; max_pixels {cfg.model.max_pixels}")
+    if cfg.is_ms_mgca:
+        a, b, d = cfg.ms_mgca.ablations[cfg.model.ms_mgca_experiment]
+        logger.info(f"MS-MGCA {cfg.model.ms_mgca_experiment}: A={a} B={b} D={d}, module lr "
+                    f"{cfg.ms_mgca.module_learning_rate:g}, confidence lr {cfg.ms_mgca.confidence_learning_rate:g}")
 
 
 def main(argv=None):
     """Main pipeline orchestrator."""
     args = parse_args(argv)
-    pick = lambda cli, constant: constant if cli is None else cli
-    cfg = PipelineConfig(
-        stage=pick(args.stage, STAGE),
-        resume=args.resume,
-        model_type=pick(args.model, MODEL_CHOICE),
-        hardware_profile=pick(args.profile, HARDWARE_PROFILE),
-        # Passed at construction: the run folder name is derived from the checkpoint and dataset mode.
-        dataset=DatasetConfig(mode=pick(args.dataset, DATASET_MODE),
-                              rxhand_official_split=pick(args.official_split, RXHAND_OFFICIAL_SPLIT),
-                              rxhand_heldout_test=pick(args.heldout_test, RXHAND_HELDOUT_TEST)),
-        augmentation=AugmentationConfig(mode=pick(args.augmentation, AUGMENTATION_MODE)),
-        model=ModelConfig(qwen_checkpoint=pick(args.checkpoint, QWEN_CHECKPOINT), yolo_checkpoint=YOLO_CHECKPOINT,
-                          yolo26_checkpoint=YOLO26_CHECKPOINT,
-                          ms_mgca_experiment=pick(args.experiment, MSMGCA_EXPERIMENT),
-                          ms_mgca_num_queries=pick(args.queries, MSMGCA_NUM_QUERIES)),
-    )
-    if args.epochs:
-        cfg.training.num_epochs = args.epochs
-    if args.samples:
-        cfg.evaluation.infer_samples = args.samples
+    cfg = build_config(args)
 
     logger.info("\n" + "=" * 60)
     logger.info("VLM TRAINING PIPELINE")
@@ -1085,9 +1372,8 @@ def main(argv=None):
     logger.info(f"Model: {cfg.model_type} ({cfg.model_name})")
     logger.info(f"Hardware profile: {cfg.hardware_profile} "
                 f"({HARDWARE_PROFILES[cfg.hardware_profile].description})")
-    logger.info(f"Precision: {cfg.mixed_precision}, 4-bit: {cfg.quantization.load_in_4bit}, "
-                f"batch: {cfg.training.per_device_train_batch_size} x "
-                f"{cfg.training.gradient_accumulation_steps} accum, workers: {cfg.training.num_workers}")
+    log_setup(cfg)
+    logger.info(f"Data-loader workers: {cfg.training.num_workers}")
     logger.info(f"Device: {cfg.device}")
     logger.info(f"PyTorch: {torch.__version__} (CUDA build: {torch.version.cuda or 'none - CPU only'})")
     logger.info(f"GPU Available: {torch.cuda.is_available()}")

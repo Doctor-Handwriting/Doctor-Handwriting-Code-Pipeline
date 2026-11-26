@@ -27,8 +27,9 @@ from configs.base_config import MSMGCAConfig
 
 logger = logging.getLogger(__name__)
 
-# Standard target modules for Qwen3-VL language model
-LORA_TARGET_REGEX = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj)"
+def lora_target_regex(target_modules: List[str]) -> str:
+    """LoRA targets restricted to the language model (the vision tower has layers with the same names)."""
+    return r".*language_model.*\.(" + "|".join(target_modules) + ")"
 
 DEFAULT_PROMPT = "Transcribe the handwritten medication name accurately."
 
@@ -114,7 +115,7 @@ def load_qwen3vl_baseline(
             lora_dropout=cfg.lora.lora_dropout,
             bias=cfg.lora.bias,
             task_type=TaskType.CAUSAL_LM,
-            target_modules=LORA_TARGET_REGEX,
+            target_modules=lora_target_regex(cfg.lora.target_modules),
         )
         model = get_peft_model(model, lora_config)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

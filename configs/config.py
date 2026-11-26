@@ -1,9 +1,19 @@
+"""Configuration types and machine plumbing for the pipeline.
+
+Every value that changes a result (hyperparameters, LoRA, quantization, MS-MGCA architecture, split, evaluation,
+augmentation) is set in the EXPERIMENT SETUP block of main.py and passed in explicitly: the dataclasses below have no
+defaults for such values, so nothing is set silently here. This file only holds
+  - the dataclass types the pipeline passes around,
+  - the hardware profiles, which decide *memory* settings only: how the fixed effective batch is split into
+    micro-batch x gradient accumulation, data-loader workers and gradient checkpointing (same experiment on every GPU),
+  - path resolution and run-folder naming.
+"""
 import os
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Literal, List, Optional
+from typing import Dict, Literal, List, Optional, Tuple, Union
 import torch
 
 
@@ -17,41 +27,82 @@ DATASET_ROOT = Path(os.environ.get("VLM_DATASET_ROOT", PROJECT_ROOT / "Dataset")
 OUTPUT_ROOT = Path(os.environ.get("VLM_OUTPUT_DIR", PROJECT_ROOT / "runs")).resolve()
 AUGMENTED_ROOT = Path(os.environ.get("VLM_AUGMENTED_DIR", PROJECT_ROOT / "Augmented_Dataset")).resolve()
 
+MODEL_TYPES = ("qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca")
 
-@dataclass
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Hardware profiles: memory only
+# ---------------------------------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
 class HardwareProfile:
-    """Machine-specific settings applied on top of the defaults below."""
+    """What a machine may change: how the effective batch (fixed in main.py) is split into micro-batch x gradient
+    accumulation, data-loader workers, and gradient checkpointing. None of these change what is learned (gradient
+    checkpointing recomputes activations, it does not change them), so a run gives the same experiment on every GPU.
+    Precision, quantization, image resolution and all hyperparameters are fixed in main.py instead."""
     description: str
-    load_in_4bit: bool
-    compute_dtype: torch.dtype
-    per_device_train_batch_size: int
-    per_device_eval_batch_size: int
-    gradient_accumulation_steps: int
+    # Qwen-VL per-device micro-batch for training / evaluation. MS-MGCA always uses 1 (its multi-scale path handles
+    # one image at a time), so on every machine it reaches the effective batch through gradient accumulation only.
+    vlm_micro_batch: int
+    vlm_eval_batch: int
     gradient_checkpointing: bool
     num_workers: int
     pin_memory: bool
-    max_pixels: int
-    train_eval_samples: Optional[int]
-    allow_tf32: bool
-    # kbit_upcast_fp32: run peft's prepare_model_for_kbit_training, which upcasts every non-quantized
-    #   weight (embeddings, lm_head) to fp32 - costs ~5GB extra on an 8B model, so off for the 12GB GPU.
-    # quantize_vision: also 4-bit quantize the vision tower; False keeps it in bf16 (better
-    #   handwriting features for ~0.6GB more VRAM).
-    kbit_upcast_fp32: bool = True
-    quantize_vision: bool = True
-    # Largest Qwen checkpoint (billions of parameters, read from its name) that fits in bf16 on this GPU
-    # for LoRA training. Such models skip 4-bit quantization (better accuracy); bigger ones use NF4
-    # QLoRA when load_in_4bit is set. 0 = always quantize.
-    max_bf16_params_b: float = 0.0
-    # Per-device batch size when MODEL_CHOICE = "yolo" (small image classifier; VRAM is not the limit
-    # on the PCs). The CRNN keeps the paper's batch of 10 on every machine.
-    yolo_batch_size: int = 32
-    # MODEL_CHOICE = "yolo26": largest per-device batch that fits for each YOLO26 size (n/s/m/l/x). The effective
-    # batch stays yolo_batch_size for every size; sizes that do not fit in one pass use gradient accumulation
-    # (e.g. 16 x 2 = 32). Measured on the 3050 Ti at 224px with fp16 autocast, see YOLO26_SIZES.
+    # MODEL_CHOICE = "yolo": largest per-device batch that fits. MODEL_CHOICE = "yolo26": the same per model size
+    # (n/s/m/l/x), measured on the 3050 Ti at 224px with bf16 autocast and extrapolated for the larger GPUs.
+    yolo_micro_batch: int
     yolo26_micro_batch: Dict[str, int] = field(default_factory=dict)
 
 
+# Select one in main.py via HARDWARE_PROFILE (or "auto" to pick by detected VRAM).
+HARDWARE_PROFILES = {
+    # Laptop: Ryzen 7, 16GB RAM, RTX 3050 Ti 4GB (Ampere, sm_86, bf16 supported). Qwen 2B at most.
+    # YOLO26x: batch 16 x accumulation (peak ~1.7GB); anything past ~4GB spills into shared system memory and
+    # trains ~10x slower.
+    "laptop_3050ti": HardwareProfile(
+        description="RTX 3050 Ti 4GB / 16GB RAM",
+        vlm_micro_batch=1, vlm_eval_batch=2, gradient_checkpointing=True, num_workers=2, pin_memory=False,
+        yolo_micro_batch=32, yolo26_micro_batch={"n": 32, "s": 32, "m": 32, "l": 32, "x": 16},
+    ),
+    # PC: Ryzen 5 3600 (6C/12T), 32GB RAM, RTX 3070 Ti 8GB (Ampere, sm_86). Sized for Qwen3-VL-2B/4B QLoRA;
+    # Qwen3-VL-8B is not recommended here.
+    "pc_3070ti": HardwareProfile(
+        description="RTX 3070 Ti 8GB / 32GB RAM",
+        vlm_micro_batch=1, vlm_eval_batch=2, gradient_checkpointing=True, num_workers=4, pin_memory=True,
+        yolo_micro_batch=64, yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 32},
+    ),
+    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120). Sized for Qwen3-VL-8B QLoRA.
+    # If CUDA OOM on qwen-vl 8B, set vlm_micro_batch=1 (the effective batch stays the same).
+    "pc_5070": HardwareProfile(
+        description="RTX 5070 12GB / 32GB RAM",
+        vlm_micro_batch=2, vlm_eval_batch=2, gradient_checkpointing=True, num_workers=4, pin_memory=True,
+        yolo_micro_batch=64, yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 64},
+    ),
+    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 Ti 16GB (Blackwell, sm_120).
+    # If CUDA OOM on qwen-vl 8B: vlm_micro_batch 2, then 1 (the effective batch stays the same).
+    "pc_5070ti": HardwareProfile(
+        description="RTX 5070 Ti 16GB / 32GB RAM",
+        vlm_micro_batch=4, vlm_eval_batch=4, gradient_checkpointing=True, num_workers=4, pin_memory=True,
+        yolo_micro_batch=64, yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 64},
+    ),
+}
+
+
+def detect_hardware_profile() -> str:
+    """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070, >=7GB -> pc_3070ti).
+    A "16GB" card reports ~15.9GiB, a "12GB" one ~11.9GiB and an "8GB" one ~8.0GiB, hence the thresholds."""
+    if not torch.cuda.is_available():
+        return "laptop_3050ti"
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram_gb >= 14:
+        return "pc_5070ti"
+    if vram_gb >= 10:
+        return "pc_5070"
+    return "pc_3070ti" if vram_gb >= 7 else "laptop_3050ti"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Name helpers
+# ---------------------------------------------------------------------------------------------------------------------
 # YOLO26 classification checkpoints (ultralytics >= 8.4): yolo26{n,s,m,l,x}-cls.pt, ImageNet-pretrained.
 YOLO26_SIZES = ("n", "s", "m", "l", "x")
 
@@ -75,121 +126,6 @@ def qwen_params_billions(checkpoint: str) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
-# Select one in main.py via HARDWARE_PROFILE (or "auto" to pick by detected VRAM).
-# All keep an effective batch size of 8 so results stay comparable across machines.
-# Model coverage per profile: qwen-vl uses the batch/precision/max_pixels below (quantization depends on the
-# checkpoint size, see max_bf16_params_b); crnn always uses its paper recipe (CRNNConfig, tiny memory
-# footprint, only num_workers/pin_memory come from here); yolo/yolo26 take their batch from yolo_batch_size
-# (yolo26 additionally splits it per model size with yolo26_micro_batch + gradient accumulation).
-HARDWARE_PROFILES = {
-    # Laptop: Ryzen 7, 16GB RAM, RTX 3050 Ti 4GB
-    "laptop_3050ti": HardwareProfile(
-        description="RTX 3050 Ti 4GB / 16GB RAM - 4-bit NF4 + LoRA, fp16",
-        load_in_4bit=True,
-        compute_dtype=torch.float16,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,
-        gradient_checkpointing=True,
-        num_workers=2,
-        pin_memory=False,
-        max_pixels=512 * 512,
-        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
-        allow_tf32=False,
-        yolo_batch_size=32,
-        # Peak reserved VRAM at 224px, fp16 (measured on this GPU): n 0.45GB, s 0.76, m 1.4, l 1.8 at batch 32;
-        # x 1.7GB at batch 16 (2.9GB at 32 leaves too little of the 4GB once Windows takes its share, and
-        # anything past ~4GB spills into shared system memory and trains 10x slower).
-        yolo26_micro_batch={"n": 32, "s": 32, "m": 32, "l": 32, "x": 16},
-    ),
-    # PC: Ryzen 5 3600 (6C/12T), 32GB RAM, RTX 3070 Ti 8GB (Ampere, sm_86, bf16 supported)
-    # Sized for Qwen3-VL-2B/4B: every Qwen checkpoint trains as QLoRA (2B bf16 weights ~4.4GB leave too little room
-    # for activations in 8GB). Batch 1 x accum 8 keeps the effective batch of 8. Qwen3-VL-8B is not recommended here.
-    "pc_3070ti": HardwareProfile(
-        description="RTX 3070 Ti 8GB / 32GB RAM - Qwen3-VL-2B/4B QLoRA (NF4 + bf16 compute)",
-        load_in_4bit=True,
-        compute_dtype=torch.bfloat16,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,
-        gradient_checkpointing=True,
-        num_workers=4,
-        pin_memory=True,
-        max_pixels=640 * 640,
-        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
-        allow_tf32=True,
-        kbit_upcast_fp32=False,
-        quantize_vision=False,
-        max_bf16_params_b=0.0,
-        yolo_batch_size=64,
-        # Extrapolated from the 3050 Ti measurements (activations scale with batch): l ~3.6GB, x ~5.8GB at batch 64.
-        # x runs at 32 x 2 to stay clear of the 8GB limit once Windows takes its share; not measured on this GPU yet.
-        yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 32},
-    ),
-    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 12GB (Blackwell, sm_120)
-    # Sized for Qwen3-VL-8B: bf16 weights alone are ~16GB, so it runs as QLoRA (NF4 weights ~6-7GB,
-    # bf16 compute, vision tower kept in bf16). Batch 2 x accum 4 = the paper's effective batch of 8;
-    # if CUDA OOM, drop to 1 x 8 (same effective batch).
-    "pc_5070": HardwareProfile(
-        description="RTX 5070 12GB / 32GB RAM - Qwen3-VL-8B QLoRA (NF4 + bf16 compute)",
-        load_in_4bit=True,
-        compute_dtype=torch.bfloat16,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=4,
-        gradient_checkpointing=True,
-        num_workers=4,
-        pin_memory=True,
-        max_pixels=768 * 768,
-        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
-        allow_tf32=True,
-        kbit_upcast_fp32=False,
-        quantize_vision=False,
-        max_bf16_params_b=3.0,  # 2B/3B: ~4-6GB bf16 weights fit; 4B+ (8GB+) is too tight with activations
-        yolo_batch_size=64,
-        # Batch 64 at 224px peaks at ~0.8GB (n) ... ~5.4GB (x) reserved, so every size fits in one pass.
-        yolo26_micro_batch={"n": 64, "s": 64, "m": 64, "l": 64, "x": 64},
-    ),
-    # PC: Ryzen 5 7500F (6C/12T), 32GB RAM, RTX 5070 Ti 16GB (Blackwell, sm_120)
-    # 16GB leaves room for the paper's batch of 4 x 2 on Qwen3-VL-8B QLoRA (NF4 weights ~7GB incl. the
-    # bf16 vision tower), and lets Qwen3-VL-2B/4B train in plain bf16 (4B weights ~8GB).
-    # If CUDA OOM on 8B: batch 2 x accum 4, then 1 x 8 (same effective batch).
-    "pc_5070ti": HardwareProfile(
-        description="RTX 5070 Ti 16GB / 32GB RAM - Qwen3-VL-8B QLoRA (NF4 + bf16), 2B/4B in bf16",
-        load_in_4bit=True,
-        compute_dtype=torch.bfloat16,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        gradient_accumulation_steps=2,
-        gradient_checkpointing=True,
-        num_workers=4,
-        pin_memory=True,
-        max_pixels=768 * 768,
-        train_eval_samples=None,  # full val set (see EvaluationConfig.train_eval_samples)
-        allow_tf32=True,
-        kbit_upcast_fp32=False,
-        quantize_vision=False,
-        max_bf16_params_b=4.5,
-        yolo_batch_size=128,
-        # Batch 128 at 224px peaks at ~1.5GB (n) ... ~10GB (x) reserved (extrapolated from the 3050 Ti
-        # measurements, activations scale linearly with batch), so every size fits in one pass. If x runs
-        # out of memory, use 64 (accumulation 2 keeps the effective batch at 128).
-        yolo26_micro_batch={"n": 128, "s": 128, "m": 128, "l": 128, "x": 128},
-    ),
-}
-
-
-# MS-MGCA-Qwen3-VL ablation configs (experiments/MS-MGCA-Qwen3-VL/configs/<name>.yaml), see MSMGCA_EXPERIMENT in main.py:
-#   e1_baseline            Qwen3-VL + LoRA only (reference)
-#   e2_multiscale          + Component A: multi-scale gated fusion
-#   e3_cross_attention     + Component B: medication-guided cross-attention
-#   e4_confidence          + Component D: uncertainty-aware confidence head
-#   e5_multiscale_crossattn  A + B
-#   e6_full_model          A + B + D (the full proposed model)
-MSMGCA_EXPERIMENTS = ("e1_baseline", "e2_multiscale", "e3_cross_attention", "e4_confidence",
-                      "e5_multiscale_crossattn", "e6_full_model")
-
-
 def find_latest_run(model_dir: Path, tag: str = "") -> Optional[Path]:
     """Most recently trained run under <output_dir>/<model_name> (one with checkpoints/final).
     `tag` restricts the search to runs whose folder name contains it (MS-MGCA: experiment + backbone size)."""
@@ -204,121 +140,107 @@ def find_run_by_suffix(model_dir: Path, suffix: str) -> Optional[Path]:
     return max(runs, key=lambda p: p.name) if runs else None
 
 
-def detect_hardware_profile() -> str:
-    """Pick a profile from the detected GPU's VRAM (>=14GB -> pc_5070ti, >=10GB -> pc_5070, >=7GB -> pc_3070ti).
-    A "16GB" card reports ~15.9GiB, a "12GB" one ~11.9GiB and an "8GB" one ~8.0GiB, hence the thresholds."""
-    if not torch.cuda.is_available():
-        return "laptop_3050ti"
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-    if vram_gb >= 14:
-        return "pc_5070ti"
-    if vram_gb >= 10:
-        return "pc_5070"
-    return "pc_3070ti" if vram_gb >= 7 else "laptop_3050ti"
-
-
+# ---------------------------------------------------------------------------------------------------------------------
+# Configuration types (values come from the EXPERIMENT SETUP block of main.py)
+# ---------------------------------------------------------------------------------------------------------------------
 @dataclass
 class QuantizationConfig:
-    """4-bit quantization configuration for memory-constrained training."""
-    load_in_4bit: bool = True
-    bnb_4bit_quant_type: str = "nf4"
-    bnb_4bit_compute_dtype: torch.dtype = torch.float16
-    bnb_4bit_use_double_quant: bool = True
-    # Set from the hardware profile (see HardwareProfile for what they do).
-    upcast_fp32: bool = True
-    quantize_vision: bool = True
+    """4-bit NF4 quantization of the Qwen backbone (QLoRA). Used by qwen-vl and ms-mgca only."""
+    load_in_4bit: bool
+    bnb_4bit_quant_type: str
+    bnb_4bit_compute_dtype: torch.dtype
+    bnb_4bit_use_double_quant: bool
+    # quantize_vision: also 4-bit quantize the vision tower (False keeps it in compute dtype).
+    # upcast_fp32: run peft's prepare_model_for_kbit_training, which upcasts every non-quantized weight
+    #   (embeddings, lm_head) to fp32 (qwen-vl only).
+    quantize_vision: bool
+    upcast_fp32: bool
 
 
 @dataclass
 class LoRAConfig:
-    """Low-Rank Adaptation configuration for parameter-efficient fine-tuning.
-    r / alpha / dropout follow Table 1 of the VLM handwriting fine-tuning paper (rank 32, alpha 64, dropout 0.05)."""
-    r: int = 32
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    bias: str = "none"
-    task_type: str = "CAUSAL_LM"
-    target_modules: List[str] = field(default_factory=lambda: [
-        # "q_proj", "k_proj", "v_proj", "o_proj",
-        # "gate_proj", "up_proj", "down_proj"
-        "q_proj", "v_proj", "o_proj"
-    ])
+    """LoRA adapter on the language model of the Qwen backbone (qwen-vl and ms-mgca alike)."""
+    r: int
+    lora_alpha: int
+    lora_dropout: float
+    bias: str
+    target_modules: Tuple[str, ...]
 
 
 @dataclass
 class TrainingConfig:
-    """Training hyperparameters for Qwen-VL / MS-MGCA. Batch/accumulation/precision are overwritten by the hardware
-    profile; CRNN and YOLO replace epochs/lr/schedule with their own recipes (apply_crnn_recipe / apply_yolo_recipe).
-    lr 2e-4, weight decay 0.01 and seed 3407 follow Table 1 of the paper. Epochs and schedule do not: the paper's
-    10 epochs with a warm restart overfit here (E6 8B run_20261112: train loss -> 0.0004, val accuracy flat after
-    ~epoch 2-3 while val loss doubled), because with offline augmentation one epoch already shows every original
-    ~8 times (original + 7 variants)."""
-    per_device_train_batch_size: int = 1
-    per_device_eval_batch_size: int = 2
-    gradient_accumulation_steps: int = 8
-    num_epochs: int = 3
-    learning_rate: float = 2e-4
-    # Paper uses 2000 warmup steps on a far larger synthetic set; with offline augmentation an epoch is ~3.6k
-    # optimizer steps (~3.6k held-out train originals x 8 views / batch 8), so 300 steps is ~3% of a 3-epoch run.
-    warmup_steps: int = 300
-    weight_decay: float = 0.01
-    optim: str = "adamw_bnb_8bit"  # 8-bit AdamW (bitsandbytes); "adamw_torch" for plain AdamW
-    # Single cosine decay: the warm restart of the 10-epoch recipe only re-ran the same descent.
-    lr_scheduler_type: str = "cosine"
-    lr_scheduler_num_cycles: int = 2  # only read when lr_scheduler_type == "cosine_with_restarts"
-    # Checkpoint selection and early stopping use a transcription metric, not eval_loss: on every model trained so
-    # far, val loss started rising (the model grows overconfident on the words it gets wrong) while val CER and
-    # exact match kept improving, so "lowest eval_loss" picked a worse checkpoint (E6 8B: 58% vs 68% exact match).
-    # Applies to every model type (CRNN / YOLO too). eval_cer comes from the generation eval on the val set.
-    metric_for_best_model: str = "eval_cer"
-    greater_is_better: bool = False
-    # Qwen-VL / MS-MGCA: stop after this many evaluations without a better val CER (x eval_steps = 2000 steps,
-    # ~0.55 epoch). 0 disables. CRNN / YOLO keep their own patience (in epochs) from their recipe configs.
-    early_stopping_patience: int = 4
-    # Keep the best checkpoint (always retained) plus the newest few so a long run does not fill the disk.
-    load_best_model_at_end: bool = True
-    save_total_limit: int = 3
-    max_grad_norm: float = 1.0
-    num_workers: int = 2
+    """Training recipe of the selected model (main.py picks the recipe for MODEL_CHOICE).
+    The hardware profile fills in the micro-batch / accumulation split of effective_batch_size and the loader
+    settings; nothing else is changed after main.py builds it."""
+    effective_batch_size: int
+    num_epochs: int
+    learning_rate: float
+    # int = number of warmup steps; float in [0, 1) = fraction of the total training steps.
+    warmup_steps: Union[int, float]
+    lr_scheduler_type: str
+    weight_decay: float
+    optim: str
+    max_grad_norm: float
+    precision: Literal["bf16", "fp32"]
+    allow_tf32: bool
+    eval_strategy: Literal["steps", "epoch"]
+    eval_steps: Optional[int]           # used when eval_strategy == "steps"; save_steps must be a multiple of it
+    save_steps: Optional[int]
+    logging_steps: int
+    metric_for_best_model: str
+    greater_is_better: bool
+    early_stopping_patience: int        # evaluations without a better metric_for_best_model; 0 disables
+    load_best_model_at_end: bool
+    save_total_limit: int
+    seed: int
+    # Set from the hardware profile (memory only):
+    per_device_train_batch_size: int = 0
+    per_device_eval_batch_size: int = 0
+    gradient_accumulation_steps: int = 0
+    num_workers: int = 0
     pin_memory: bool = False
-    use_bf16: bool = True         # Set to True since your 5070 natively rocks bf16
-    use_fp16: bool = False        # Turn off fp16 when using bf16
-    gradient_checkpointing: bool = True
-    seed: int = 3407
+
+    @property
+    def use_bf16(self) -> bool:
+        return self.precision == "bf16"
+
+    @property
+    def use_fp16(self) -> bool:
+        return False  # every supported GPU (Ampere and newer) runs bf16
+
+    @property
+    def eval_by_epoch(self) -> bool:
+        return self.eval_strategy == "epoch"
 
 
 @dataclass
 class DatasetConfig:
-    """Dataset paths and processing parameters."""
+    """Which data is used and how it is split. Paths default to <dataset_root>/DHP and <dataset_root>/RxHand."""
+    # "combined" -> DHP + RxHand merged into one pool, then one train/val split
+    # "dhp"      -> DHP only: its own train/val split, RxHand is ignored
+    # "rxhand"   -> RxHand only: its own train/val split, DHP is ignored
+    mode: Literal["combined", "dhp", "rxhand"]
+    # mode == "rxhand" only: train on RxHand's official Train_Set and validate on its Test_Set.
+    rxhand_official_split: bool
+    # mode == "rxhand" only: Train_Set is split into train/val and the official Test_Set is kept as a held-out test
+    # set that only the infer stage reads. The split is written once to rxhand_split_dir and read back from there.
+    rxhand_heldout_test: bool
+    train_split: float
+    val_split: float
+    split_seed: int
+    max_samples: Optional[int]
+
     dataset_root: str = DATASET_ROOT.as_posix()
+    rxhand_split_dir: str = (PROJECT_ROOT / "configs" / "splits" / "rxhand").as_posix()
     # Sub-paths left empty are derived from dataset_root in __post_init__.
     dhp_root: str = ""
     dhp_labels: str = ""
     dhp_images: str = ""
-
     rxhand_root: str = ""
     rxhand_train_labels: str = ""
     rxhand_test_labels: str = ""
     rxhand_train_images: str = ""
     rxhand_test_images: str = ""
-
-    # Which data is used (set DATASET_MODE in main.py):
-    #   "combined" -> DHP + RxHand merged into one pool, then one train/val split (default)
-    #   "dhp"      -> DHP only: its own train/val split, RxHand is ignored
-    #   "rxhand"   -> RxHand only: its own train/val split, DHP is ignored
-    mode: Literal["combined", "dhp", "rxhand"] = "combined"
-    # mode == "rxhand" only: train on RxHand's official Train_Set and validate on its Test_Set instead of
-    # re-splitting them together (the DHP dataset has no official split).
-    rxhand_official_split: bool = False
-    # mode == "rxhand" only: Train_Set is split into train/val (train_split, seed 42) and the official Test_Set is
-    # kept as a held-out test set that only the infer stage reads. The split is written once to rxhand_split_dir
-    # (train.csv / val.csv / test.csv, committed to git) and read back from there, so every machine uses the same images.
-    rxhand_heldout_test: bool = False
-    rxhand_split_dir: str = (PROJECT_ROOT / "configs" / "splits" / "rxhand").as_posix()
-
-    train_split: float = 0.80
-    val_split: float = 0.20
-    max_samples: int = None
 
     def __post_init__(self):
         if self.mode not in ("combined", "dhp", "rxhand"):
@@ -343,7 +265,7 @@ class DatasetConfig:
 
     @property
     def mode_tag(self) -> str:
-        """Suffix for run folder names; empty for the default combined setup."""
+        """Suffix for run folder names; empty for the combined setup."""
         if self.mode == "combined":
             return ""
         if self.rxhand_official_split:
@@ -365,44 +287,39 @@ class DatasetConfig:
 
 @dataclass
 class EvaluationConfig:
-    """Generation-based evaluation (WER/CER/accuracy) settings."""
-    # Val samples decoded with model.generate at every eval step during training.
-    # None = full val set (the default): checkpoint selection and early stopping use val CER, and on a
-    # subset of 50-100 images it is too noisy (+-5 points) to tell checkpoints apart. An int limits it to the first N.
-    train_eval_samples: Optional[int] = None
-    # Val samples used by the "infer" stage; None = full val set.
-    infer_samples: Optional[int] = None
-    max_new_tokens: int = 64
-    # Adapter loaded by the "infer" stage (defaults to <checkpoint_dir>/final).
+    """Generation-based evaluation (WER/CER/accuracy) and MS-MGCA confidence calibration."""
+    train_eval_samples: Optional[int]   # val images decoded at every eval during training (None = all)
+    infer_samples: Optional[int]        # images scored by calibrate / infer (None = all)
+    max_new_tokens: int
+    # STAGE = "calibrate": the val set is split once into a calibration part (fits the confidence head on the model's
+    # real right/wrong transcriptions) and an evaluation part (reports ECE / Brier / AUROC).
+    calibration_fraction: float
+    calibration_steps: int
+    calibration_lr: float
+    calibration_weight_decay: float
+    calibration_batch_size: int
+    calibration_val_fraction: float     # share of the calibration part kept aside to pick the best fitting step
+    calibration_seed: int
+    # Adapter loaded by the "infer" stage (empty = <checkpoint_dir>/final).
     adapter_path: str = ""
-    # MS-MGCA confidence calibration (STAGE = "calibrate"): the held-out val set is split once into a calibration
-    # part (fits the confidence head on the model's real right/wrong transcriptions) and an evaluation part
-    # (reports ECE / Brier / AUROC, and is what the infer stage scores the confidence on).
-    calibration_fraction: float = 0.5
-    calibration_steps: int = 300       # AdamW steps on the cached features (no VLM forward, takes seconds)
-    calibration_lr: float = 1e-3
-    calibration_seed: int = 3407
 
 
 @dataclass
 class AugmentationConfig:
-    """Data augmentation parameters."""
-    # "online"  -> random transforms applied to each training image while training (nothing stored, new
-    #              variation every epoch)
-    # "offline" -> variants are pre-computed once by STAGE = "augment" into offline_root and training reads
-    #              them from there (fixed, inspectable, reproducible). Set AUGMENTATION_MODE in main.py.
-    mode: Literal["online", "offline"] = "online"
+    """Data augmentation. mode "online": random transforms per training image while training; "offline": variants
+    pre-computed once by STAGE = "augment" into offline_root and read from there."""
+    mode: Literal["online", "offline"]
+    enable_augmentation: bool
+    offline_include_mixed: bool   # offline: also write one variant with all six transforms applied together
+    offline_seed: int             # offline: variants are deterministic for a given seed and settings
+    motion_blur_prob: float
+    elastic_deform_prob: float
+    perspective_prob: float
+    brightness_contrast_prob: float
+    rotation_limit: int
+    shift_limit: float
+    scale_limit: float
     offline_root: str = AUGMENTED_ROOT.as_posix()
-    offline_include_mixed: bool = True  # offline: also write one variant with all six transforms applied together
-    offline_seed: int = 42              # offline: variants are deterministic for a given seed and settings
-    enable_augmentation: bool = True
-    motion_blur_prob: float = 0.3
-    elastic_deform_prob: float = 0.3
-    perspective_prob: float = 0.2
-    brightness_contrast_prob: float = 0.5
-    rotation_limit: int = 15
-    shift_limit: float = 0.1
-    scale_limit: float = 0.2
 
     def __post_init__(self):
         if self.mode not in ("online", "offline"):
@@ -410,144 +327,104 @@ class AugmentationConfig:
 
     @property
     def mode_tag(self) -> str:
-        """Suffix for run folder names; empty for the default online augmentation."""
+        """Suffix for run folder names; empty for online augmentation."""
         return "_offline" if self.mode == "offline" else ""
 
 
 @dataclass
 class CRNNConfig:
-    """CRNN from "Medical Handwritten Prescription Recognition Using CRNN" (Achkar et al., 2019):
-    13 VGG16 convolution layers -> 3 bidirectional LSTM layers -> CTC, trained from scratch.
-    Used when MODEL_CHOICE = "crnn"; replaces the LoRA/Qwen training recipe (see apply_crnn_recipe)."""
-    img_height: int = 64    # paper: text-line images normalized to 64px height
-    img_width: int = 340    # paper: 340x60 prescription crops; aspect-preserving resize + white padding
-    lstm_hidden: int = 256
-    lstm_layers: int = 3
-    batch_norm: bool = True  # not in the paper; makes a from-scratch VGG16+CTC stack train reliably
-    learning_rate: float = 5e-4  # paper: 0.0005
-    batch_size: int = 10         # paper: 10
-    num_epochs: int = 300        # paper: up to 1,000,000 but stops early (it took ~200)
-    early_stopping_patience: int = 20  # paper: stop after 20 epochs without improvement
+    """CRNN architecture (13 VGG16 conv layers -> BiLSTM -> CTC). Its training recipe is a TrainingConfig."""
+    img_height: int
+    img_width: int
+    lstm_hidden: int
+    lstm_layers: int
+    batch_norm: bool
 
 
 @dataclass
 class YOLOConfig:
-    """Ultralytics YOLO *classification* backbone used as a closed-vocabulary word recognizer:
-    every distinct training label is a class, and the predicted class name is the transcription.
-    Used when MODEL_CHOICE = "yolo". Fine-tunes ImageNet-pretrained weights; the batch size comes from
-    the hardware profile (yolo_batch_size)."""
-    imgsz: int = 224           # images are resized to imgsz x imgsz (ultralytics classification default)
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.01
-    num_epochs: int = 50
-    warmup_steps: int = 100
-    label_smoothing: float = 0.1
-    early_stopping_patience: int = 10  # epochs without val-loss improvement
+    """YOLO classification backbone used as a closed-vocabulary word recognizer (yolo and yolo26 alike)."""
+    imgsz: int
+    label_smoothing: float
 
 
 @dataclass
-class YOLO26Config(YOLOConfig):
-    """YOLO26 classification backbone (yolo26{n,s,m,l,x}-cls.pt), same closed-vocabulary word recognizer as
-    YOLOConfig. Used when MODEL_CHOICE = "yolo26". The batch comes from the hardware profile
-    (yolo_batch_size split by yolo26_micro_batch + gradient accumulation).
-    The dataset crops are square (~128x128), so the square 224px input keeps their aspect ratio."""
-    # Peak learning rate by model size: AdamW on pretrained weights, lower for the deeper/wider l and x
-    # (heuristic, not tuned on this dataset).
-    learning_rate_by_size: Dict[str, float] = field(default_factory=lambda: {
-        "n": 1e-3, "s": 1e-3, "m": 1e-3, "l": 5e-4, "x": 5e-4,
-    })
+class MSMGCASetup:
+    """MS-MGCA-Qwen3-VL architecture and its extra learning rates. The pipeline builds the experiment's config from
+    this (the YAML files in experiments/MS-MGCA-Qwen3-VL/configs are only read by that package's own scripts)."""
+    # Ablation name -> (multi-scale fusion A, medication cross-attention B, confidence head D)
+    ablations: Dict[str, Tuple[bool, bool, bool]]
+    module_learning_rate: float        # multi-scale and cross-attention modules
+    confidence_learning_rate: float    # confidence head
+    multiscale: Dict
+    cross_attention: Dict
+    uncertainty: Dict
 
 
 @dataclass
 class ModelConfig:
-    """Model architecture and checkpoint parameters."""
-    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"] = "qwen-vl"
-    qwen_checkpoint: str = "Qwen/Qwen3-VL-8B-Instruct"
-    # MODEL_CHOICE = "ms-mgca": which ablation (E1-E6) to build; one of MSMGCA_EXPERIMENTS. The backbone is
-    # qwen_checkpoint (must be a Qwen3-VL model).
-    ms_mgca_experiment: str = "e6_full_model"
-    # Number of medication queries K of the cross-attention (E3/E5/E6; the paper sweeps 1, 4, 8).
-    # None = the value in the experiment YAML (4). Part of the run folder name when set (..._k8).
-    ms_mgca_num_queries: Optional[int] = None
-    # Must be an ultralytics *classification* checkpoint (name ends with "-cls"), e.g.
-    # yolov8n-cls.pt / yolov8s-cls.pt / yolov8m-cls.pt / yolov8l-cls.pt / yolov8x-cls.pt.
-    yolo_checkpoint: str = "yolov8m-cls.pt"
-    # YOLO26 classification checkpoint: yolo26n-cls.pt | yolo26s-cls.pt | yolo26m-cls.pt | yolo26l-cls.pt | yolo26x-cls.pt
-    yolo26_checkpoint: str = "yolo26m-cls.pt"
-    max_pixels: int = 512 * 512
-    min_pixels: int = 256 * 256
-    max_seq_length: int = 512
-    gradient_checkpointing: bool = True
+    """Which model is trained and its input size."""
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"]
+    qwen_checkpoint: str
+    # MODEL_CHOICE = "ms-mgca": which ablation (a key of MSMGCASetup.ablations); the backbone is qwen_checkpoint.
+    ms_mgca_experiment: str
+    # Number of medication queries K (None = MSMGCASetup.cross_attention["num_queries"]). In the run name when set.
+    ms_mgca_num_queries: Optional[int]
+    yolo_checkpoint: str
+    yolo26_checkpoint: str
+    max_pixels: int
+    gradient_checkpointing: bool = False  # set from the hardware profile for qwen-vl / ms-mgca
 
 
 @dataclass
 class PipelineConfig:
-    """Master pipeline configuration."""
-    stage: Literal["augment", "train", "calibrate", "infer"] = "train"
+    """Master configuration, built by main.py (build_config)."""
+    stage: Literal["augment", "train", "calibrate", "infer"]
     # --resume (MS-MGCA): train continues the newest run of this exact setting from its latest checkpoint (a new run
     # when there is none); a stage whose output already exists is skipped (see main.py).
-    resume: bool = False
-    hardware_profile: str = "auto"  # "auto", or a key of HARDWARE_PROFILES
-    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"] = "qwen-vl"
+    resume: bool
+    hardware_profile: str  # "auto", or a key of HARDWARE_PROFILES
+    model_type: Literal["qwen-vl", "crnn", "yolo", "yolo26", "ms-mgca"]
+
+    quantization: QuantizationConfig
+    lora: LoRAConfig
+    training: TrainingConfig
+    dataset: DatasetConfig
+    augmentation: AugmentationConfig
+    model: ModelConfig
+    ms_mgca: MSMGCASetup
+    crnn: CRNNConfig
+    yolo: YOLOConfig
+    evaluation: EvaluationConfig
+
     device: str = "cuda"
-    mixed_precision: str = "fp16"
-
-    quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
-    lora: LoRAConfig = field(default_factory=LoRAConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    crnn: CRNNConfig = field(default_factory=CRNNConfig)
-    yolo: YOLOConfig = field(default_factory=YOLOConfig)
-    yolo26: YOLO26Config = field(default_factory=YOLO26Config)
-    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-
     output_dir: str = OUTPUT_ROOT.as_posix()
     # Every run gets its own folder: <output_dir>/<model_name>/<run_name>/
     #   checkpoints/  logs/  plots/  metrics_history.{json,csv}  eval_metrics.json  run_config.json
-    # Left empty -> "run_<timestamp>_<hardware_profile>" for train; for infer, the latest trained run.
+    # Left empty -> "run_<timestamp>_<hardware_profile>..." for train; for calibrate/infer, the latest trained run.
     run_name: str = ""
-    # Left empty -> derived from output_dir/run_name in __post_init__.
     run_dir: str = ""
     checkpoint_dir: str = ""
     log_dir: str = ""
     plots_dir: str = ""
-    # Qwen-VL / MS-MGCA evaluate on the full val set (generation included), which takes minutes on a VLM, so every
-    # 500 optimizer steps (~7 evaluations per epoch). save_steps must stay a multiple of eval_steps.
-    save_steps: int = 500
-    eval_steps: int = 500
-    log_steps: int = 10
-    # Evaluate/checkpoint once per epoch instead of every eval_steps/save_steps (set for the CRNN recipe,
-    # whose early stopping counts epochs).
-    eval_by_epoch: bool = False
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
-        if self.model_type != self.model.model_type:
-            self.model.model_type = self.model_type
+        if self.model_type not in MODEL_TYPES:
+            raise ValueError(f"Unknown model '{self.model_type}'. Options: {', '.join(MODEL_TYPES)}")
+        self.model.model_type = self.model_type
+        self.validate()
         self.apply_hardware_profile()
-        if self.model_type == "crnn":
-            self.apply_crnn_recipe()
-        elif self.is_yolo:
-            self.apply_yolo_recipe()
-        elif self.is_ms_mgca:
-            self.apply_ms_mgca_recipe()
         self.resolve_run_paths()
 
+    # --- model family ---------------------------------------------------------------------------------------------
     @property
     def is_ms_mgca(self) -> bool:
         return self.model_type == "ms-mgca"
 
     @property
-    def run_tag(self) -> str:
-        """Run-folder fragment that keeps MS-MGCA ablations and backbones apart, e.g. "_e6_full_model_2B"
-        ("_e6_full_model_2B_k8" when the number of medication queries is overridden)."""
-        if not self.is_ms_mgca:
-            return ""
-        size_b = qwen_params_billions(self.model.qwen_checkpoint)
-        k = f"_k{self.model.ms_mgca_num_queries}" if self.model.ms_mgca_num_queries else ""
-        return f"_{self.model.ms_mgca_experiment}_{f'{size_b:g}B' if size_b else 'custom'}{k}"
+    def is_vlm(self) -> bool:
+        """Qwen-based models (LoRA / QLoRA on the Qwen backbone)."""
+        return self.model_type in ("qwen-vl", "ms-mgca")
 
     @property
     def is_yolo(self) -> bool:
@@ -561,8 +438,11 @@ class PipelineConfig:
 
     @property
     def yolo_settings(self) -> YOLOConfig:
-        """Recipe settings (image size, lr, label smoothing, early stopping) of the selected YOLO family."""
-        return self.yolo26 if self.model_type == "yolo26" else self.yolo
+        return self.yolo
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self.quantization.bnb_4bit_compute_dtype if self.training.use_bf16 else torch.float32
 
     @property
     def model_name(self) -> str:
@@ -575,6 +455,79 @@ class PipelineConfig:
             name = Path(self.yolo_checkpoint).name
             return name[:-3] if name.endswith(".pt") else name
         return self.model.qwen_checkpoint.rstrip("/").split("/")[-1]
+
+    @property
+    def run_tag(self) -> str:
+        """Run-folder fragment that keeps MS-MGCA ablations and backbones apart, e.g. "_e6_full_model_2B"
+        ("_e6_full_model_2B_k8" when the number of medication queries is overridden)."""
+        if not self.is_ms_mgca:
+            return ""
+        size_b = qwen_params_billions(self.model.qwen_checkpoint)
+        k = f"_k{self.model.ms_mgca_num_queries}" if self.model.ms_mgca_num_queries else ""
+        return f"_{self.model.ms_mgca_experiment}_{f'{size_b:g}B' if size_b else 'custom'}{k}"
+
+    # --- setup ----------------------------------------------------------------------------------------------------
+    def validate(self) -> None:
+        """Reject combinations that cannot run, instead of silently changing a setting."""
+        if self.training.use_bf16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            raise ValueError("This GPU does not support bf16, which the fixed setup uses (precision 'bf16'). "
+                             "Every supported profile is Ampere or newer.")
+        if self.training.eval_strategy == "steps" and self.training.save_steps % self.training.eval_steps:
+            raise ValueError("save_steps must be a multiple of eval_steps (load_best_model_at_end needs a checkpoint "
+                             "at every evaluation).")
+        if self.is_vlm and "qwen" not in self.model.qwen_checkpoint.lower():
+            raise ValueError(f"'{self.model.qwen_checkpoint}' is not a Qwen-VL checkpoint (set QWEN_CHECKPOINT).")
+        if self.is_ms_mgca:
+            if self.model.ms_mgca_experiment not in self.ms_mgca.ablations:
+                raise ValueError(f"Unknown MS-MGCA experiment '{self.model.ms_mgca_experiment}'. "
+                                 f"Options: {', '.join(self.ms_mgca.ablations)}")
+            k = self.model.ms_mgca_num_queries
+            if k is not None and k < 1:
+                raise ValueError(f"MSMGCA_NUM_QUERIES must be a positive integer (1, 4 or 8 in the paper), got {k}.")
+            if "qwen3" not in self.model.qwen_checkpoint.lower():
+                raise ValueError(f"MS-MGCA needs a Qwen3-VL backbone, got '{self.model.qwen_checkpoint}' "
+                                 f"(set QWEN_CHECKPOINT in main.py, e.g. Qwen/Qwen3-VL-2B-Instruct).")
+        if self.model_type == "yolo26":
+            yolo26_size(self.model.yolo26_checkpoint)
+
+    def apply_hardware_profile(self) -> None:
+        """Split the fixed effective batch into micro-batch x gradient accumulation for this machine and set the
+        loader settings. Nothing that changes what is learned is touched here."""
+        if self.hardware_profile == "auto":
+            self.hardware_profile = detect_hardware_profile()
+        if self.hardware_profile not in HARDWARE_PROFILES:
+            raise ValueError(f"Unknown hardware profile '{self.hardware_profile}'. "
+                             f"Options: auto, {', '.join(HARDWARE_PROFILES)}")
+        hw = HARDWARE_PROFILES[self.hardware_profile]
+        t = self.training
+        effective = t.effective_batch_size
+
+        if self.is_ms_mgca:
+            micro, eval_batch = 1, 1
+        elif self.model_type == "qwen-vl":
+            micro, eval_batch = hw.vlm_micro_batch, hw.vlm_eval_batch
+        elif self.model_type == "yolo26":
+            micro = hw.yolo26_micro_batch.get(yolo26_size(self.model.yolo26_checkpoint), hw.yolo_micro_batch)
+            eval_batch = micro
+        elif self.model_type == "yolo":
+            micro = eval_batch = hw.yolo_micro_batch
+        else:  # crnn: tiny, the whole batch fits on every machine
+            micro = eval_batch = effective
+        micro = min(micro, effective)
+        if effective % micro:
+            raise ValueError(f"Effective batch {effective} is not a multiple of the {self.hardware_profile} "
+                             f"micro-batch {micro}; adjust the profile so the effective batch stays exact.")
+
+        t.per_device_train_batch_size = micro
+        t.per_device_eval_batch_size = eval_batch
+        t.gradient_accumulation_steps = effective // micro
+        t.num_workers = hw.num_workers
+        t.pin_memory = hw.pin_memory
+        self.model.gradient_checkpointing = hw.gradient_checkpointing and self.is_vlm
+
+        if t.allow_tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     def resolve_run_paths(self) -> None:
         """Derive this run's folder and its sub-folders (directories are created by the stages)."""
@@ -597,131 +550,3 @@ class PipelineConfig:
         self.log_dir = self.log_dir or (run / "logs").as_posix()
         self.plots_dir = self.plots_dir or (run / "plots").as_posix()
         self.evaluation.adapter_path = self.evaluation.adapter_path or (Path(self.checkpoint_dir) / "final").as_posix()
-
-    def apply_hardware_profile(self) -> None:
-        """Overwrite machine-dependent settings with the selected hardware profile."""
-        if self.hardware_profile == "auto":
-            self.hardware_profile = detect_hardware_profile()
-        if self.hardware_profile not in HARDWARE_PROFILES:
-            raise ValueError(f"Unknown hardware profile '{self.hardware_profile}'. "
-                             f"Options: auto, {', '.join(HARDWARE_PROFILES)}")
-        hw = HARDWARE_PROFILES[self.hardware_profile]
-
-        if hw.compute_dtype == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-            print("[WARNING] GPU does not support bf16, falling back to fp16")
-            hw = replace(hw, compute_dtype=torch.float16)
-        use_bf16 = hw.compute_dtype == torch.bfloat16
-
-        # Small enough to train in plain bf16? Then skip quantization (unknown size -> keep the profile default).
-        size_b = qwen_params_billions(self.model.qwen_checkpoint)
-        fits_bf16 = size_b is not None and size_b <= hw.max_bf16_params_b and hw.compute_dtype == torch.bfloat16
-        self.quantization.load_in_4bit = hw.load_in_4bit and not fits_bf16
-        self.quantization.bnb_4bit_compute_dtype = hw.compute_dtype
-        self.quantization.upcast_fp32 = hw.kbit_upcast_fp32
-        self.quantization.quantize_vision = hw.quantize_vision
-        self.mixed_precision = "bf16" if use_bf16 else "fp16"
-
-        t = self.training
-        t.per_device_train_batch_size = hw.per_device_train_batch_size
-        t.per_device_eval_batch_size = hw.per_device_eval_batch_size
-        t.gradient_accumulation_steps = hw.gradient_accumulation_steps
-        t.gradient_checkpointing = hw.gradient_checkpointing
-        t.num_workers = hw.num_workers
-        t.pin_memory = hw.pin_memory
-        t.use_bf16 = use_bf16
-        t.use_fp16 = not use_bf16
-
-        self.model.gradient_checkpointing = hw.gradient_checkpointing
-        self.model.max_pixels = hw.max_pixels
-        self.evaluation.train_eval_samples = hw.train_eval_samples
-
-        if hw.allow_tf32 and torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-    def apply_crnn_recipe(self) -> None:
-        """CRNN trains from scratch in fp32 with the paper's recipe (lr 5e-4, batch 10, early stopping),
-        so the Qwen/LoRA settings the hardware profile just applied are replaced. Worker count and
-        pin_memory still come from the profile."""
-        c = self.crnn
-        self._apply_small_model_recipe(
-            batch_size=c.batch_size, learning_rate=c.learning_rate, num_epochs=c.num_epochs,
-            weight_decay=0.0, warmup_steps=0, scheduler="constant", fp32=True)
-
-    def apply_yolo_recipe(self) -> None:
-        """YOLO classifier fine-tunes pretrained weights with AdamW + cosine decay. Batch size comes from
-        the hardware profile; precision (bf16/fp16 autocast) stays as the profile set it.
-        YOLO26 splits the profile's effective batch into the largest micro-batch that fits for the chosen
-        model size plus gradient accumulation (e.g. 16 x 2 = 32 for yolo26x on the 4GB laptop)."""
-        hw = HARDWARE_PROFILES[self.hardware_profile]
-        c = self.yolo_settings
-        batch_size, accum, learning_rate = hw.yolo_batch_size, 1, c.learning_rate
-        if self.model_type == "yolo26":
-            size = yolo26_size(self.model.yolo26_checkpoint)
-            batch_size = min(hw.yolo26_micro_batch.get(size, hw.yolo_batch_size), hw.yolo_batch_size)
-            accum = -(-hw.yolo_batch_size // batch_size)  # ceil
-            learning_rate = c.learning_rate_by_size.get(size, c.learning_rate)
-        self._apply_small_model_recipe(
-            batch_size=batch_size, learning_rate=learning_rate, num_epochs=c.num_epochs,
-            weight_decay=c.weight_decay, warmup_steps=c.warmup_steps, scheduler="cosine", fp32=False,
-            gradient_accumulation_steps=accum)
-
-    def apply_ms_mgca_recipe(self) -> None:
-        """MS-MGCA-Qwen3-VL (experiments/MS-MGCA-Qwen3-VL) keeps the Qwen LoRA/QLoRA setup of the hardware profile
-        with three differences:
-          - micro-batch 1: its multi-scale / cross-attention path processes one image at a time, so the profile's
-            effective batch (batch x accumulation = 8) is reached through gradient accumulation only;
-          - bf16 compute: its custom modules are bf16 (the 3050 Ti supports bf16 too);
-          - plain AdamW: the optimizer is built with per-component learning rates (see MSMGCATrainer in main.py).
-        Gradient checkpointing is enabled inside the model loader, not by the Trainer."""
-        if self.model.ms_mgca_experiment not in MSMGCA_EXPERIMENTS:
-            raise ValueError(f"Unknown MS-MGCA experiment '{self.model.ms_mgca_experiment}'. "
-                             f"Options: {', '.join(MSMGCA_EXPERIMENTS)}")
-        k = self.model.ms_mgca_num_queries
-        if k is not None and k < 1:
-            raise ValueError(f"MSMGCA_NUM_QUERIES must be a positive integer (1, 4 or 8 in the paper), got {k}.")
-        if "qwen3" not in self.model.qwen_checkpoint.lower():
-            raise ValueError(f"MS-MGCA needs a Qwen3-VL backbone, got '{self.model.qwen_checkpoint}' "
-                             f"(set QWEN_CHECKPOINT in main.py, e.g. Qwen/Qwen3-VL-2B-Instruct).")
-        if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-            raise ValueError("MS-MGCA needs a GPU with bf16 support.")
-        t = self.training
-        t.gradient_accumulation_steps *= t.per_device_train_batch_size
-        t.per_device_train_batch_size = 1
-        t.per_device_eval_batch_size = 1
-        t.optim = "adamw_torch"
-        t.use_bf16, t.use_fp16 = True, False
-        self.mixed_precision = "bf16"
-        self.quantization.bnb_4bit_compute_dtype = torch.bfloat16
-
-    def _apply_small_model_recipe(self, *, batch_size: int, learning_rate: float, num_epochs: int,
-                                  weight_decay: float, warmup_steps: int, scheduler: str,
-                                  fp32: bool, gradient_accumulation_steps: int = 1) -> None:
-        """Replace the Qwen/LoRA settings the hardware profile applied with those of a small image model
-        (CRNN, YOLO classifier): no quantization, per-epoch evaluation, and no gradient accumulation
-        unless the model needs it to reach its batch size."""
-        t = self.training
-        self.quantization.load_in_4bit = False
-        if fp32:
-            self.quantization.bnb_4bit_compute_dtype = torch.float32
-            self.mixed_precision = "fp32"
-            t.use_bf16 = t.use_fp16 = False
-
-        t.per_device_train_batch_size = batch_size
-        t.per_device_eval_batch_size = batch_size
-        t.gradient_accumulation_steps = gradient_accumulation_steps
-        t.num_epochs = num_epochs
-        t.learning_rate = learning_rate
-        t.warmup_steps = warmup_steps
-        t.weight_decay = weight_decay
-        t.optim = "adamw_torch"
-        t.lr_scheduler_type = scheduler
-        t.gradient_checkpointing = False
-        self.model.gradient_checkpointing = False
-
-        self.evaluation.train_eval_samples = None  # decoding is cheap: score the full val set
-        self.eval_by_epoch = True
-
-    @property
-    def compute_dtype(self) -> torch.dtype:
-        return self.quantization.bnb_4bit_compute_dtype

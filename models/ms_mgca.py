@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
-from configs.config import MSMGCA_EXPERIMENTS, PROJECT_ROOT
+from configs.config import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -72,27 +72,65 @@ def load_experiment() -> SimpleNamespace:
     )
 
 
-def experiment_yaml(name: str) -> Path:
-    if name not in MSMGCA_EXPERIMENTS:
-        raise ValueError(f"Unknown MS-MGCA experiment '{name}'. Options: {', '.join(MSMGCA_EXPERIMENTS)}")
-    return EXPERIMENT_DIR / "configs" / f"{name}.yaml"
-
-
 def build_ms_mgca_config(cfg, checkpoint_dir: Optional[str] = None):
-    """Experiment config for this run. Architecture switches (multiscale / cross_attention / uncertainty) come from
-    the experiment YAML, or from the config saved next to a trained checkpoint so inference always rebuilds the
-    architecture that was trained. Machine / backbone settings come from the pipeline's PipelineConfig."""
+    """Experiment config (the experiment package's MSMGCAConfig) for this run.
+
+    Training: built entirely from the pipeline config, i.e. the EXPERIMENT SETUP block of main.py (backbone, QLoRA,
+    LoRA, the ablation's component switches, module architecture and learning rates). The experiment YAML files are
+    not read; they only serve the package's own standalone scripts.
+    Inference (checkpoint_dir given): the config saved next to the checkpoint, so the architecture that was trained is
+    rebuilt exactly (including the K and confidence threshold it was trained with). The LoRA adapter's own config
+    (r, alpha, targets) is read from the adapter folder by PEFT."""
     exp = load_experiment()
     saved = Path(checkpoint_dir) / CONFIG_FILE if checkpoint_dir else None
-    msc = exp.MSMGCAConfig.from_yaml(str(saved if saved and saved.is_file() else experiment_yaml(cfg.model.ms_mgca_experiment)))
+    if saved is not None and saved.is_file():
+        msc = exp.MSMGCAConfig.from_yaml(str(saved))
+    elif checkpoint_dir:
+        raise FileNotFoundError(f"{saved} is missing; cannot rebuild the architecture this checkpoint was trained with.")
+    else:
+        msc = exp.MSMGCAConfig()
+        m = cfg.ms_mgca
+        multiscale, cross_attention, uncertainty = m.ablations[cfg.model.ms_mgca_experiment]
+        for section, enabled, values in ((msc.multiscale, multiscale, m.multiscale),
+                                         (msc.cross_attention, cross_attention, m.cross_attention),
+                                         (msc.uncertainty, uncertainty, m.uncertainty)):
+            section.enabled = enabled
+            for key, value in values.items():
+                if not hasattr(section, key):
+                    raise KeyError(f"Unknown MS-MGCA setting '{key}' for {type(section).__name__}")
+                setattr(section, key, value)
+        if cfg.model.ms_mgca_num_queries:
+            msc.cross_attention.num_queries = cfg.model.ms_mgca_num_queries
 
-    if cfg.model.ms_mgca_num_queries and not checkpoint_dir:  # a trained checkpoint keeps the K it was trained with
-        msc.cross_attention.num_queries = cfg.model.ms_mgca_num_queries
+        q, lora, t = cfg.quantization, cfg.lora, cfg.training
+        msc.model.bnb_4bit_quant_type = q.bnb_4bit_quant_type
+        msc.model.bnb_4bit_use_double_quant = q.bnb_4bit_use_double_quant
+        msc.model.quantize_vision = q.quantize_vision
+        msc.lora.enabled = True
+        msc.lora.r, msc.lora.lora_alpha, msc.lora.lora_dropout = lora.r, lora.lora_alpha, lora.lora_dropout
+        msc.lora.bias = lora.bias
+        msc.lora.target_modules = list(lora.target_modules)
+        msc.training.learning_rate = t.learning_rate
+        msc.training.adapter_learning_rate = m.module_learning_rate
+        msc.training.confidence_learning_rate = m.confidence_learning_rate
+        # Recorded in the saved config for reference (the pipeline's Trainer runs the schedule):
+        msc.training.batch_size = t.per_device_train_batch_size
+        msc.training.gradient_accumulation_steps = t.gradient_accumulation_steps
+        msc.training.num_epochs = t.num_epochs
+        msc.training.weight_decay = t.weight_decay
+        msc.training.warmup_ratio = t.warmup_steps if isinstance(t.warmup_steps, float) else 0.0
+        msc.training.lr_scheduler_type = t.lr_scheduler_type
+        msc.training.mixed_precision = t.precision
+        msc.training.seed = t.seed
+        msc.training.save_steps = t.save_steps or 0
+        msc.training.eval_steps = t.eval_steps or 0
+        msc.training.logging_steps = t.logging_steps
+
+    # Backbone and machine settings, for training and inference alike.
     msc.model.checkpoint = cfg.model.qwen_checkpoint
     msc.model.load_in_4bit = cfg.quantization.load_in_4bit
     msc.model.bnb_4bit_compute_dtype = "bfloat16"
     msc.model.max_pixels = cfg.model.max_pixels
-    msc.lora.r, msc.lora.lora_alpha, msc.lora.lora_dropout = cfg.lora.r, cfg.lora.lora_alpha, cfg.lora.lora_dropout
     msc.training.gradient_checkpointing = cfg.model.gradient_checkpointing
     msc.training.output_dir = cfg.output_dir
     msc.training.run_name = cfg.run_name
@@ -260,11 +298,11 @@ def head_scores(model, features: torch.Tensor) -> torch.Tensor:
         return head(features.float().to(device))[1].reshape(-1).cpu()
 
 
-def fit_confidence_head(model, features: torch.Tensor, targets: torch.Tensor,
-                        steps: int = 300, lr: float = 1e-3, seed: int = 3407) -> Optional[Dict]:
+def fit_confidence_head(model, features: torch.Tensor, targets: torch.Tensor, *, steps: int, lr: float,
+                        weight_decay: float, batch_size: int, val_fraction: float, seed: int) -> Optional[Dict]:
     """Fine-tune the confidence head (warm start = the jointly trained head) with BCE on cached (h, z) pairs, in fp32.
-    20% of the pairs are kept aside to pick the best step, so the head does not memorise a few hundred samples.
-    Returns the fit log, or None (head untouched) when the labels contain a single class."""
+    `val_fraction` of the pairs is kept aside to pick the best step, so the head does not memorise a few hundred
+    samples. Returns the fit log, or None (head untouched) when the labels contain a single class."""
     import copy
     n = len(targets)
     n_pos = int(targets.sum().item())
@@ -277,18 +315,18 @@ def fit_confidence_head(model, features: torch.Tensor, targets: torch.Tensor,
     head = copy.deepcopy(live).float()
     gen = torch.Generator().manual_seed(seed)
     order = torch.randperm(n, generator=gen)
-    n_val = max(int(0.2 * n), 1) if n >= 10 else 0
+    n_val = max(int(val_fraction * n), 1) if n >= 10 else 0
     val_idx, fit_idx = order[:n_val], order[n_val:]
     device = next(live.parameters()).device
     x, z = features.float().to(device), targets.float().to(device)
     head.to(device)
 
-    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-2)
+    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
     best = (float("inf"), copy.deepcopy(head.state_dict()), 0)
     log = []
     for step in range(1, steps + 1):
         head.train()
-        batch = fit_idx[torch.randint(len(fit_idx), (min(64, len(fit_idx)),), generator=gen)]
+        batch = fit_idx[torch.randint(len(fit_idx), (min(batch_size, len(fit_idx)),), generator=gen)]
         loss = head.compute_loss(head(x[batch])[0], z[batch])
         opt.zero_grad()
         loss.backward()

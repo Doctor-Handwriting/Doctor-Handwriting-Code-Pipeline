@@ -1,6 +1,10 @@
 # Vision-Language Model Training Pipeline
 
-Production-ready handwriting-recognition training pipeline optimized for **RTX 3050 Ti (4GB VRAM)** and larger RTX 5070/5070 Ti systems. It supports Qwen-VL, the proposed MS-MGCA-Qwen3-VL, the paper-based CRNN, and YOLO/YOLO26 classification models.
+Handwriting-recognition training pipeline for the RTX 3050 Ti (4GB), RTX 3070 Ti (8GB) and RTX 5070 / 5070 Ti
+machines. It supports Qwen-VL, the proposed MS-MGCA-Qwen3-VL, the paper-based CRNN, and YOLO/YOLO26 classification
+models. Every hyperparameter is fixed in one place (the `EXPERIMENT SETUP` block of `main.py`, see
+[Configuration](#configuration)), and the GPU only changes memory settings, so a run is the same experiment on
+every machine.
 
 ## Docs
 
@@ -23,7 +27,7 @@ Production-ready handwriting-recognition training pipeline optimized for **RTX 3
 Doctor-Handwriting-Code-Pipeline/
 ├── configs/
 │   ├── __init__.py
-│   ├── config.py          # Dataclass configs (hardware, LoRA, training, paths)
+│   ├── config.py          # Config types, memory-only hardware profiles, paths (no hyperparameter values)
 │   └── splits/rxhand/     # train.csv / val.csv / test.csv of the held-out RxHand split (committed)
 ├── docs/                  # MODEL_STATUS.md, how_to_run.md, NOTEBOOK_GUIDE.md
 ├── paper/                 # LaTeX manuscript (manuscript/) and reference PDFs (references/)
@@ -57,9 +61,9 @@ Doctor-Handwriting-Code-Pipeline/
 │           ├── metrics_history.json / .csv   # every logged train/eval value
 │           ├── metrics_summary.csv # best / average / last loss & accuracy
 │           ├── eval_metrics.json   # final evaluation
-│           ├── run_config.json     # full config snapshot of the run
+│           ├── run_config.json     # the full resolved setup of the run (every hyperparameter)
 │           └── inference_results.json, inference_metrics.json   # infer stage
-├── main.py                # Pipeline orchestrator (augment/train/calibrate/infer)
+├── main.py                # Run selection + EXPERIMENT SETUP (all hyperparameters) + pipeline stages
 └── requirements.txt       # All dependencies
 ```
 
@@ -162,9 +166,10 @@ QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"  # backbone for "qwen-vl" and "ms-
 MSMGCA_EXPERIMENT = "e6_full_model"   # used when MODEL_CHOICE = "ms-mgca": e1_baseline ... e6_full_model
 YOLO26_CHECKPOINT = "yolo26m-cls.pt"  # n / s / m / l / x, used when MODEL_CHOICE = "yolo26"
 HARDWARE_PROFILE = "pc_5070ti"  # or "laptop_3050ti", "pc_3070ti", "pc_5070", "auto"
-DATASET_MODE = "combined"  # or "dhp" / "rxhand" to train and validate on one dataset only
-RXHAND_OFFICIAL_SPLIT = False  # "rxhand" only: True = train on Train_Set, validate on Test_Set
-AUGMENTATION_MODE = "online"  # or "offline": pre-computed Augmented_Dataset/ (run STAGE = "augment" first)
+DATASET_MODE = "rxhand"       # or "combined" / "dhp"
+RXHAND_HELDOUT_TEST = True    # "rxhand" only: train/val from Train_Set, official Test_Set for infer only
+RXHAND_OFFICIAL_SPLIT = False # "rxhand" only: True = train on Train_Set, validate on Test_Set
+AUGMENTATION_MODE = "offline" # or "online"; "offline" needs STAGE = "augment" once first
 
 python main.py
 ```
@@ -200,16 +205,15 @@ generated for every image of the datasets selected by `DATASET_MODE`, so changin
 regeneration; a different `DATASET_MODE` needs `STAGE = "augment"` run once for it. Labels still come from
 `Dataset/`. To regenerate after changing the augmentation settings, delete `Augmented_Dataset/` and re-run
 the augment stage (a settings mismatch is warned about at train time). Offline runs get `_offline` in their run
-folder name. `VLM_AUGMENTED_DIR` moves the folder; `AugmentationConfig.offline_include_mixed = False` drops
+folder name. `VLM_AUGMENTED_DIR` moves the folder; `offline_include_mixed=False` in `AUGMENTATION` (`main.py`) drops
 the `_mixed` variant.
 
 **YOLO26 (`MODEL_CHOICE = "yolo26"`)** fine-tunes the YOLO26 classification backbones
 (`yolo26{n,s,m,l,x}-cls.pt`, 3.6M-30.4M parameters) as a closed-vocabulary word recognizer: each distinct
 training label is a class. Ultralytics has no text-generating YOLO26 variant (the open-vocabulary YOLOE-26 models
 are box detectors), so classification is the only YOLO26 task that fits box-less word labels. Every size runs on
-every profile at the same effective batch per profile (32 laptop / 64 `pc_3070ti` / 64 `pc_5070` / 128 `pc_5070ti`);
-`yolo26x` uses gradient accumulation on the 4GB laptop (16 x 2) and on `pc_3070ti` (32 x 2), everything else fits
-in one pass.
+every profile with the same effective batch of 64 (`YOLO_TRAINING`); where a size does not fit in one pass the
+profile splits it with gradient accumulation (laptop: 32 x 2, `yolo26x` 16 x 4; `pc_3070ti` `yolo26x`: 32 x 2).
 
 **Inference Stage:**
 ```bash
@@ -237,7 +241,7 @@ Pick the ablation with `MSMGCA_EXPERIMENT` and the backbone with `QWEN_CHECKPOIN
 
 ```python
 MODEL_CHOICE = "ms-mgca"
-QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"   # any Qwen3-VL checkpoint; 2B trains in plain bf16 on pc_5070
+QWEN_CHECKPOINT = "Qwen/Qwen3-VL-2B-Instruct"   # any Qwen3-VL checkpoint; every size trains as 4-bit QLoRA
 MSMGCA_EXPERIMENT = "e6_full_model"
 MSMGCA_NUM_QUERIES = None   # medication queries K (E3/E5/E6): None = 4, or 1 / 4 / 8 for the K sweep
 STAGE = "train"   # then "calibrate" (E4/E6 only), then "infer"
@@ -271,9 +275,11 @@ python run_ms_mgca_ablations.py --resume              # or: python main.py ... -
 the LoRA/module weights, optimizer, learning-rate schedule and step counter from its latest `checkpoint-<step>`, and
 continues in the same run folder (the plots and `metrics_history` keep the earlier steps; only the steps after the
 checkpoint are repeated). Stages whose output already exists are skipped: a finished training, a `calibrated/`
-checkpoint, an `inference_metrics.json`. With no earlier run it simply starts a new one. `--epochs` must match the
-original run, otherwise the learning-rate schedule would change, so the run is refused with a message.
-Checkpoints are written every `save_steps` (100) optimizer steps, so at most that much work is lost.
+checkpoint, an `inference_metrics.json`. With no earlier run it simply starts a new one. The run must continue with
+the setup it started with: if any value of the `EXPERIMENT SETUP` (or `--epochs`) differs from its `run_config.json`,
+the run is refused and the differing values are listed. Runs trained before the current setup therefore cannot be
+resumed; start them again. Checkpoints are written every `save_steps` (500) optimizer steps, so at most that much
+work is lost.
 
 All runs of one ablation share backbone, dataset, augmentation and seed (3407; the random initialisation of the new
 modules is seeded too), so the rows of the table differ only in the architecture. `compare_ms_mgca.py` writes
@@ -281,22 +287,25 @@ modules is seeded too), so the rows of the table differ only in the architecture
 AUROC, review rate), `metrics_comparison.png`, one `reliability_<run>.png` per confidence-aware run and
 `risk_coverage_comparison.png`. Use `--dataset` / `--size` to compare only runs of one setting.
 
-- **Training** fine-tunes LoRA and all enabled MS-MGCA components jointly. Each component has its own learning
-  rate from the experiment config (LoRA 2e-4, adapters 5e-4, confidence head 1e-3). With the confidence head the loss
-  is `L_text + lambda_c * L_conf`; during training a sample counts as correct (z = 1) when the model's teacher-forced
+- **Training** fine-tunes LoRA and all enabled MS-MGCA components jointly, with the same QLoRA recipe as `qwen-vl`
+  (see [Configuration](#configuration)). The randomly initialised modules get their own learning rate
+  (`MSMGCA_MODULE_LR` / `MSMGCA_CONFIDENCE_LR`, 1.8e-4; LoRA 1.4e-4). With the confidence head the loss is
+  `L_text + lambda_c * L_conf`; during training a sample counts as correct (z = 1) when the model's teacher-forced
   prediction reproduces every answer token, which is only a proxy on data the model is fitting (see calibration).
-  Checkpoints are selected on the text loss alone.
+  Checkpoints are selected on validation CER.
+- **Architecture settings** (the E1-E6 switches, crop grid, K, heads, confidence threshold, loss weight) come from
+  `MSMGCA_ABLATIONS`, `MSMGCA_MULTISCALE`, `MSMGCA_CROSS_ATTENTION` and `MSMGCA_UNCERTAINTY` in `main.py`. The YAML
+  files in `experiments/MS-MGCA-Qwen3-VL/configs/` are only read by that package's standalone scripts.
 - **Calibration (`STAGE = "calibrate"`, E4/E6):** the confidence head must learn whether a *generated* transcription
   is right, which needs labels from images the model did not train on. The stage transcribes the validation images
   (never trained on), labels each transcription right/wrong (exact match), splits them once into a calibration part
-  (`EvaluationConfig.calibration_fraction`, default 50%) and a held-out part, fits the head on the calibration part
+  (`calibration_fraction` in `EVALUATION`, 50%) and a held-out part, fits the head on the calibration part
   with BCE, and reports ECE / Brier / AUROC on the held-out part before and after
   (`calibration_metrics.json`, `plots/reliability_*_calibration.png`). The result is saved as
   `checkpoints/calibrated/`, which the infer stage then uses, scoring confidence on the held-out part only.
   This is a one-fold hold-out version of out-of-fold calibration (a true K-fold would retrain the model K times).
 - **Batch size:** the multi-scale / cross-attention path handles one image at a time, so MS-MGCA always uses
-  micro-batch 1 with gradient accumulation (effective batch 8 on every profile, same as the other models).
-  It needs a GPU with bf16 support.
+  micro-batch 1 with gradient accumulation (effective batch 8 on every profile, same as `qwen-vl`).
 - **Outputs:** `runs/MS-MGCA-Qwen3-VL/run_<time>_<profile>_<experiment>_<size>[_dataset][_offline]/`, e.g.
   `run_20261111-101500_pc_5070_e6_full_model_2B_rxhand`. `checkpoints/final/` holds only the LoRA adapter
   (`lora_adapter/`), the module weights (`ms_mgca_modules.safetensors`) and the experiment config
@@ -318,58 +327,57 @@ AUROC, review rate), `metrics_comparison.png`, one `reliability_<run>.png` per c
 
 ## Configuration
 
-Edit `configs/config.py` to customize:
+`main.py` has two blocks at the top:
 
-### Hardware Profiles
+- **RUN SELECTION**: what to run (`STAGE`, `MODEL_CHOICE`, `QWEN_CHECKPOINT`, `MSMGCA_EXPERIMENT`,
+  `HARDWARE_PROFILE`, `DATASET_MODE`, ...). Each constant can also be given on the command line (`python main.py --help`).
+- **EXPERIMENT SETUP**: every value that changes a result: training recipes, QLoRA / LoRA, the MS-MGCA architecture
+  and ablation switches, split, evaluation, calibration and augmentation. Each value cites the paper it comes from.
+  `configs/config.py` holds no values of its own: a setting missing from `main.py` is an error, never a silent
+  default. The resolved setup of every run is written to `run_config.json`.
 
-Set `HARDWARE_PROFILE` in `main.py` to `auto`, `laptop_3050ti`, `pc_3070ti`, `pc_5070`, or `pc_5070ti`.
-The selected profile supplies batch size, accumulation, workers, image resolution, and precision:
+### Setup for Qwen-VL and MS-MGCA (all ablations, every backbone size)
 
-| Profile | Precision | Train batch x accumulation | Max image pixels |
-|---|---|---:|---:|
-| `laptop_3050ti` | 4-bit NF4 + fp16 | 1 x 8 | 512 x 512 |
-| `pc_3070ti` | NF4 QLoRA + bf16 for Qwen3-VL-2B/4B (8B not recommended) | 1 x 8 | 640 x 640 |
-| `pc_5070` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 2 x 4 | 768 x 768 |
-| `pc_5070ti` | NF4 QLoRA + bf16 for Qwen3-VL-8B | 4 x 2 | 768 x 768 |
+| Setting | Value | Source |
+|---|---|---|
+| Quantization | 4-bit NF4 + double quantization, bf16 compute, vision tower in bf16 | QLoRA (Dettmers et al., NeurIPS 2023), App. B.2 |
+| LoRA | r = 64, alpha = 16, dropout 0.1, on all 7 linear layers of the language model (q/k/v/o/gate/up/down) | QLoRA Sec. 4 and App. B.2; rank 64 also in Huttner et al. (handwriting) and the Manchu VLM-OCR paper (arXiv:2507.06761) |
+| Learning rate | LoRA 1.4e-4, MS-MGCA modules 1.8e-4 | QLoRA 2e-4 at batch 16 and the LLaVA-1.5 connector 1e-3 at batch 256 (CVPR 2024), scaled to batch 8 with the square-root rule for Adam (Malladi et al., NeurIPS 2022) |
+| Schedule | 10% linear warmup, then cosine decay | longer warmup lowers LR sensitivity (Wortsman et al., ICLR 2024); cosine as in LLaVA-1.5 |
+| Optimizer | 8-bit AdamW, weight decay 0.01, gradient clipping 0.3 | Dettmers et al., ICLR 2022; clipping from QLoRA App. B.2 |
+| Batch | effective 8 | |
+| Length | at most 3 epochs, early stopping after 4 evaluations (2000 steps) without a better val CER | Prechelt 1998; with offline augmentation an epoch shows every original ~8 times |
+| Selection | best validation CER (full val set every 500 steps) | val loss rose while CER still improved in earlier runs |
+| Input | at most 512 x 512 px (the RxHand crops are 128 x 128; only DHP images are downscaled), 64 new tokens | |
+| Seeds | training 3407, split 42 (keeps `configs/splits/rxhand/` valid) | |
 
-Qwen checkpoints that fit the profile's bf16 parameter limit skip 4-bit quantization. The `crnn` recipe
-always uses fp32 and batch 10; YOLO/YOLO26 batch sizes come from the selected profile. If the 8B Qwen model
-causes CUDA OOM, reduce the profile batch to 1 x 8 in `configs/config.py` or use a smaller checkpoint.
+CRNN (`CRNN_TRAINING`) keeps the recipe of its paper (lr 5e-4, batch 10, fp32, early stopping after 20 epochs), and
+YOLO / YOLO26 (`YOLO_TRAINING`, `YOLO26_LEARNING_RATE`) use batch 64, AdamW + cosine and early stopping after 10
+epochs.
 
-The laptop-specific defaults are:
-```python
-per_device_train_batch_size = 1           # Don't increase!
-gradient_accumulation_steps = 8           # Effective batch = 8
-num_workers = 2                           # Prevent RAM pressure
-```
+### Hardware profiles (memory only)
 
-### Quantization
-```python
-load_in_4bit = True
-bnb_4bit_quant_type = "nf4"
-bnb_4bit_compute_dtype = torch.float16
-bnb_4bit_use_double_quant = True
-```
+Set `HARDWARE_PROFILE` in `main.py` to `auto`, `laptop_3050ti`, `pc_3070ti`, `pc_5070`, or `pc_5070ti`. A profile only
+decides how the fixed effective batch is split into micro-batch x gradient accumulation, the data-loader workers and
+gradient checkpointing; precision, quantization, resolution and every hyperparameter are the same on every machine.
 
-### LoRA Adaptation
-```python
-r = 32, lora_alpha = 64, lora_dropout = 0.05
-target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", 
-                  "gate_proj", "up_proj", "down_proj"]
-```
+| Profile | Qwen-VL micro-batch x accumulation | MS-MGCA | YOLO | Intended backbone |
+|---|---:|---:|---:|---|
+| `laptop_3050ti` | 1 x 8 | 1 x 8 | 32 x 2 | Qwen3-VL-2B |
+| `pc_3070ti` | 1 x 8 | 1 x 8 | 64 x 1 | Qwen3-VL-2B / 4B |
+| `pc_5070` | 2 x 4 | 1 x 8 | 64 x 1 | Qwen3-VL-8B |
+| `pc_5070ti` | 4 x 2 | 1 x 8 | 64 x 1 | Qwen3-VL-8B |
+
+All profiles need a GPU with bf16 (Ampere or newer). On CUDA OOM, lower `vlm_micro_batch` of the profile in
+`configs/config.py` (the effective batch, and so the experiment, stays the same) or use a smaller backbone.
 
 ### Augmentation
-```python
-enable_augmentation = True  # used by online augmentation
-motion_blur_prob = 0.3
-elastic_deform_prob = 0.3
-perspective_prob = 0.2
-brightness_contrast_prob = 0.5
-```
 
+`AUGMENTATION` in `main.py` holds the transform probabilities and limits (online mode) and the offline seed.
 `AUGMENTATION_MODE = "offline"` is a separate workflow: run `STAGE = "augment"` first to create
 `Augmented_Dataset/`, then run `train` or `infer`. Offline runs include `_offline` in their run name and
-use fixed, reproducible variants; validation images are never augmented.
+use fixed, reproducible variants; validation images are never augmented. After changing a value, delete
+`Augmented_Dataset/` and run the augment stage again.
 
 ## Dataset Format
 
@@ -396,17 +404,11 @@ Datasets are automatically converted to multimodal instruction format:
 
 ## Memory Management
 
-**4GB VRAM Optimization:**
-- Batch size: 1 (per device)
-- Gradient accumulation: 8 steps (effective batch = 8)
-- Mixed precision: fp16
-- Gradient checkpointing: enabled
-- Dynamic resolution: 256×256 to 512×512
-
-**Expected Memory Usage:**
-- Model weights (4-bit): ~1.5 GB
-- Activations + optimizer: ~2.0 GB
-- Reserve: ~0.5 GB for overhead
+- Qwen backbones are 4-bit NF4; gradient checkpointing is on for every profile.
+- LoRA r = 64 on all 7 linear layers adds ~175M trainable parameters on Qwen3-VL-8B (~70M on 2B). With 8-bit AdamW
+  that is roughly 1.5-2 GB for the adapter weights, gradients and optimizer state on 8B.
+- On Windows, a run that exceeds VRAM does not crash: it spills into shared system memory and trains several times
+  slower (GPU utilisation drops). Watch the first steps in Task Manager / `nvidia-smi`.
 
 ## Monitoring
 
@@ -428,17 +430,17 @@ python -m utils.visualization runs/Qwen3-VL-2B-Instruct/run_20261002-120000_lapt
 ```
 
 ### Checkpoints
-- Auto-saved every `save_steps` iterations
-- Final adapter in `runs/<model_name>/<run>/checkpoints/final`
-- Resume training from checkpoint (automatic)
+- Saved every `save_steps` (500) optimizer steps for Qwen-VL / MS-MGCA, every epoch for CRNN / YOLO
+- `checkpoints/final` holds the best checkpoint (lowest val CER), restored at the end of training
+- MS-MGCA runs can be resumed with `--resume` (see above)
 
 ### Progress & Metrics
 Training shows a progress bar with live `loss`, `tok_acc`, `lr`, `grad_norm` and the latest eval metrics.
 Every `eval_steps` a table of all evaluation metrics is printed and logged to TensorBoard;
 the final evaluation is saved to `<run>/eval_metrics.json`. The infer stage evaluates the
-latest trained run of the model (`<run>/checkpoints/final`; set `cfg.run_name` to pick another)
-on the validation set and writes `inference_results.json` (per sample) and
-`inference_metrics.json` into that run's folder.
+latest trained run of the model (`<run>/checkpoints/final`) on the held-out test set (the validation set when the
+dataset mode has none) and writes `inference_results.json` (per sample) and `inference_metrics.json` into that
+run's folder.
 
 - **token_accuracy / eval_token_accuracy**: Next-token accuracy on answer tokens (teacher-forced), train and val
 
@@ -452,36 +454,25 @@ on the validation set and writes `inference_results.json` (per sample) and
   free-form transcription. YOLO detection checkpoints such as `yolov8n.pt` are not supported; use a
   `-cls` checkpoint.
 
-WER/CER/accuracy require `model.generate`, which is slow, so during training they are computed on
-`cfg.evaluation.train_eval_samples` (default 50) val samples. On a bigger GPU set it higher or to
-`None` for the whole val set; `cfg.evaluation.infer_samples` controls the infer stage.
+WER/CER/accuracy require `model.generate`, which is slow on a VLM, but checkpoint selection and early stopping use
+val CER, so it is computed on the whole val set at every evaluation (`train_eval_samples=None` in `EVALUATION`).
+`--samples N` limits the images scored by calibrate / infer.
 
 ## Training Tips
 
-1. **First Run**: Monitor GPU memory on first step
-   ```python
-   # In main.py, reduce max_samples temporarily
-   cfg.dataset.max_samples = 100
-   ```
-
-2. **Checkpointing**: Resume interrupted training
-   ```python
-   # Trainer automatically resumes from latest checkpoint
-   ```
-
-3. **Validation**: Check `runs/<model_name>/<run>/plots/` or TensorBoard
-
-4. **Fine-tune Learning Rate**: Start at 1e-4, adjust if loss plateaus
-   ```python
-   cfg.training.learning_rate = 5e-5  # More conservative
-   ```
+1. **First run**: watch GPU memory and `grad_norm` in the first steps. For a quick smoke test set
+   `MAX_SAMPLES = 100` in `main.py` (do not report such runs).
+2. **Validation**: check `runs/<model_name>/<run>/plots/` or TensorBoard. A healthy run's train loss keeps falling
+   through the end of warmup (10% of the steps); a sudden jump to ~2 with val CER above 1 is divergence, not
+   overfitting.
+3. **Changing a hyperparameter**: edit it in the `EXPERIMENT SETUP` block, and use the same value for every run you
+   compare. Runs with different setups are told apart by their `run_config.json`, not by the folder name.
 
 ## Troubleshooting
 
 ### CUDA Out of Memory
-- Reduce `per_device_eval_batch_size` to 1
-- Disable augmentation: `cfg.augmentation.enable_augmentation = False`
-- Reduce `max_seq_length` in ModelConfig
+- Lower `vlm_micro_batch` / `vlm_eval_batch` of your profile in `configs/config.py` (the effective batch stays 8)
+- Use a smaller backbone (`QWEN_CHECKPOINT`), e.g. Qwen3-VL-4B or 2B
 
 ### Slow Data Loading
 - Increase `num_workers` cautiously (check RAM usage)
@@ -491,17 +482,23 @@ WER/CER/accuracy require `model.generate`, which is slow, so during training the
 ### Missing Dataset Files
 - Make sure `Dataset/` sits in the repo root, or set `VLM_DATASET_ROOT` (see "Dataset Location")
 - Check `.trashed-*` files are being filtered
-- Run with `cfg.dataset.max_samples = 10` to debug
-
-## Performance Benchmarks
-
-On RTX 3050 Ti (4GB):
-- **Training Speed**: ~2-3 samples/sec with gradient accumulation
-- **Inference Speed**: ~1 sample/sec
-- **Epoch Time**: ~40-60 minutes (varies by dataset size)
-- **Memory Peak**: ~3.8 GB (safe margin from limit)
+- Run with `MAX_SAMPLES = 10` in `main.py` to debug
 
 ## References
+
+Setup sources (cited in the `EXPERIMENT SETUP` block of `main.py`):
+
+- Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs", NeurIPS 2023. https://arxiv.org/abs/2305.14314
+- Malladi et al., "On the SDEs and Scaling Rules for Adaptive Gradient Algorithms", NeurIPS 2022. https://arxiv.org/abs/2205.10287
+- Liu et al., "Improved Baselines with Visual Instruction Tuning" (LLaVA-1.5), CVPR 2024. https://arxiv.org/abs/2310.03744
+- Wortsman et al., "Small-scale proxies for large-scale Transformer training instabilities", ICLR 2024. https://arxiv.org/abs/2309.14322
+- Huttner et al., "Low-Rank Adaptation vs. Fine-Tuning for Handwritten Text Recognition" (`paper/references/`)
+- Chung & Choi, "Finetuning Vision-Language Models as OCR Systems for Low-Resource Languages: A Case Study of Manchu", arXiv:2507.06761. https://arxiv.org/abs/2507.06761
+- Dettmers et al., "8-bit Optimizers via Block-wise Quantization", ICLR 2022. https://arxiv.org/abs/2110.02861
+- Prechelt, "Early Stopping - But When?", Neural Networks: Tricks of the Trade, Springer 1998
+- Achkar et al., "Medical Handwritten Prescription Recognition Using CRNN", 2019 (CRNN baseline)
+
+Libraries:
 
 - Qwen-VL: https://github.com/QwenLM/Qwen-VL
 - Qwen3-VL: https://github.com/QwenLM/Qwen3-VL

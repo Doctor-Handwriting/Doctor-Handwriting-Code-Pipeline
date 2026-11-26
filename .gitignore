@@ -34,11 +34,13 @@ __pycache__/
 # Explicitly track CSV and JSON results
 !*.csv
 !*.json
+# PEFT writes a template model card (README.md) into every saved adapter; it holds no run information.
+# The adapter's adapter_config.json and the MS-MGCA ms_mgca_config.yaml next to it stay tracked.
+runs/**/checkpoints/**/README.md
 # YOLO / export artifacts
 *.onnx
 *.engine
 *.torchscript
-*.log
 events.out.tfevents.*
 nohup.out
 wandb/

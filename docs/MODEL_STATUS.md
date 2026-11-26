@@ -110,7 +110,7 @@ Untuk paper, latih ulang semua model dengan dataset dan split yang sama (`--data
 - Rencana: latih ulang dengan `--heldout-test`.
 
 ### Qwen3-VL-4B-Instruct
-- Belum dijalankan. Di `pc_5070ti` dilatih tanpa kuantisasi (bf16); di `pc_5070` dan GPU 8GB memakai 4-bit.
+- Belum dijalankan. Semua ukuran Qwen dilatih sebagai QLoRA 4-bit di semua GPU (lihat `EXPERIMENT SETUP` di `main.py`).
 - Rencana: jalankan dengan `--heldout-test`.
 
 ### Qwen3-VL-8B-Instruct

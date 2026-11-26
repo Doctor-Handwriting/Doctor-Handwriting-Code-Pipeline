@@ -45,8 +45,10 @@ def _get_qwen_model_class(version: str):
         return Qwen2_5_VLForConditionalGeneration
 
 
-# Restrict LoRA to the language model; vision tower layer names differ between Qwen versions.
-LORA_TARGET_REGEX = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+def lora_target_regex(target_modules) -> str:
+    """LoRA targets (LORA["target_modules"] in main.py) restricted to the language model; vision tower layer names
+    differ between Qwen versions and some match the same projection names."""
+    return r".*language_model.*\.(" + "|".join(target_modules) + ")"
 
 
 def load_qwen_vl(cfg, adapter_path: str = None):
@@ -119,7 +121,7 @@ def load_qwen_vl(cfg, adapter_path: str = None):
         lora_dropout=cfg.lora.lora_dropout,
         bias=cfg.lora.bias,
         task_type=TaskType.CAUSAL_LM,
-        target_modules=LORA_TARGET_REGEX,
+        target_modules=lora_target_regex(cfg.lora.target_modules),
     )
     model = get_peft_model(model, lora_config)
 

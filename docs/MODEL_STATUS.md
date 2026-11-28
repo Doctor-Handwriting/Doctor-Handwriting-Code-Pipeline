@@ -1,6 +1,6 @@
 # Status Model dan Hasil
 
-Terakhir diperbarui: 22 Nov 2026. Sumber: folder `runs/` (`metrics_summary.csv`, `eval_metrics.json`, `trainer_state.json`).
+Terakhir diperbarui: 28 Nov 2026. Sumber: folder `runs/` (`metrics_summary.csv`, `eval_metrics.json`, `trainer_state.json`).
 
 Semua angka adalah nilai terbaik di validation set selama training. CER dan WER: makin kecil makin baik.
 
@@ -20,6 +20,8 @@ Dataset tidak disimpan di repo. Letakkan di `Dataset/DHP/` dan `Dataset/RxHand/`
 
 | Run | Model | Dataset | Aug | Epoch | Akurasi | Akurasi norm. | CER | WER | Eval |
 |---|---|---|---|---|---|---|---|---|---|
+| `run_20261126-115345_pc_3070ti_rxhand-heldout_offline` | Qwen3-VL-4B | rxhand held-out | offline | 2.8 | 66.5% | 72.0% | 0.122 | 0.328 | full val |
+| ↳ test set (1115 gambar) | Qwen3-VL-4B | rxhand held-out | offline | | **40.8%** | **48.2%** | **0.307** | 0.631 | Test_Set |
 | `run_20261007-160021_pc_5070` | Qwen3-VL-8B | combined | online | 10 | 64% | 73% | 0.121 | 0.360 | 100 sampel |
 | `run_20261003-062700_pc_5070` | Qwen3-VL-2B | combined | online | 25 | 66% | 71% | 0.133 | 0.316 | 100 sampel |
 | `run_20261004-111109_pc_5070` | Qwen3-VL-2B | combined | online | 50 | 66% | 71% | 0.131 | 0.333 | 100 sampel |
@@ -110,8 +112,10 @@ Untuk paper, latih ulang semua model dengan dataset dan split yang sama (`--data
 - Rencana: latih ulang dengan `--heldout-test`.
 
 ### Qwen3-VL-4B-Instruct
-- Belum dijalankan. Semua ukuran Qwen dilatih sebagai QLoRA 4-bit di semua GPU (lihat `EXPERIMENT SETUP` di `main.py`).
-- Rencana: jalankan dengan `--heldout-test`.
+- Run pertama dengan `--heldout-test` (pc_3070ti, offline aug). Early stopping di step 10000, checkpoint terbaik step 8000.
+- Val 66.5% vs test 40.8%: 59% gambar test berisi kata yang ada di train (akurasi norm. 68%), 41% kata baru (20%). Val acak dari Train_Set berbagi kosakata dengan train, jadi angka val terlalu optimis.
+- Val loss naik sejak step 2500 (0.61 ke 0.90) walau CER terus turun.
+- Zero-shot (tanpa LoRA) di test: akurasi 19.7%, CER 0.50.
 
 ### Qwen3-VL-8B-Instruct
 - CER terendah di antara run Qwen (0.121). Butuh GPU 12GB+ (4-bit QLoRA), tidak disarankan di GPU 8GB.

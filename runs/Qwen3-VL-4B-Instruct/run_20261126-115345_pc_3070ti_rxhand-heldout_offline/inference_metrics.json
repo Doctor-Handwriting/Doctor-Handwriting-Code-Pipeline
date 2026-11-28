@@ -1,0 +1,14 @@
+{
+  "wer": 0.6305578011317704,
+  "cer": 0.30675767918088737,
+  "mer": 0.6032482598607889,
+  "wil": 0.829392320064517,
+  "accuracy": 0.4080717488789238,
+  "accuracy_normalized": 0.48161434977578477,
+  "char_accuracy": 0.6932423208191126,
+  "num_samples": 1115,
+  "num_correct": 455,
+  "num_correct_normalized": 537,
+  "gt_pred": "1115/455",
+  "gt_pred_normalized": "1115/537"
+}
